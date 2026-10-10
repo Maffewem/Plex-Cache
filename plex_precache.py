@@ -36,7 +36,7 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 __released__ = "2026-10-10"
 
 log = logging.getLogger("plex-precache")
@@ -942,11 +942,12 @@ def render_status(d: dict, settings: str = "") -> str:
     if not d["streams"] and overall in (GOOD, INFO):
         verdict = "Nothing playing right now, and everything looks healthy."
     return f"""<!doctype html><html><head><meta charset=utf-8>
-<meta name=viewport content="width=device-width,initial-scale=1"><title>Plex-Cache</title><style>
-:root{{color-scheme:light dark;--bg:#fff;--fg:#1c1c1c;--muted:#666;--line:#ddd;--card:#f6f6f7;
---good:#1f8a4c;--warn:#b7791f;--bad:#c53030;--info:#4a6fa5}}
-@media (prefers-color-scheme:dark){{:root{{--bg:#16181d;--fg:#e6e6e6;--muted:#9a9a9a;
---line:#333;--card:#1f2228;--good:#3fb871;--warn:#e0a43a;--bad:#ef5b5b;--info:#7aa2e3}}}}
+<meta name=viewport content="width=device-width,initial-scale=1"><title>Plex-Cache</title>
+<link rel=icon href="{FAVICON}"><script>try{{var t=localStorage.getItem('plexcache-theme');
+if(t)document.documentElement.dataset.theme=t}}catch(e){{}}</script><style>
+:root{{color-scheme:light;--bg:#fff;--fg:#1c1c1c;--muted:#666;--line:#ddd;--card:#f6f6f7;--good:#1f8a4c;--warn:#b7791f;--bad:#c53030;--info:#4a6fa5;--accent:#e5a00d;--accent-fg:#1c1c1c;--btn:#ececef}}
+@media (prefers-color-scheme:dark){{:root:not([data-theme=light]){{color-scheme:dark;--bg:#16181d;--fg:#e6e6e6;--muted:#9a9a9a;--line:#333;--card:#1f2228;--good:#3fb871;--warn:#e0a43a;--bad:#ef5b5b;--info:#7aa2e3;--accent:#e5a00d;--accent-fg:#1c1c1c;--btn:#2a2e36}}}}
+:root[data-theme=dark]{{color-scheme:dark;--bg:#16181d;--fg:#e6e6e6;--muted:#9a9a9a;--line:#333;--card:#1f2228;--good:#3fb871;--warn:#e0a43a;--bad:#ef5b5b;--info:#7aa2e3;--accent:#e5a00d;--accent-fg:#1c1c1c;--btn:#2a2e36}}
 body{{background:var(--bg);color:var(--fg);font:15px system-ui,sans-serif;margin:0 auto;
 max-width:900px;padding:16px}}h1{{font-size:22px;margin:0}}h2{{font-size:16px;margin-top:28px}}
 table{{width:100%;border-collapse:collapse}}td,th{{text-align:left;padding:6px 8px;
@@ -964,7 +965,7 @@ var(--info);border-radius:6px;padding:10px 12px;margin:8px 0}}.card p{{margin:6p
 .verdict.bad{{color:var(--bad)}}.verdict.info{{color:var(--info)}}
 .bar{{height:6px;background:var(--line);border-radius:3px;margin-top:8px;overflow:hidden}}
 .bar i{{display:block;height:100%;background:var(--good)}}.card.warn .bar i{{background:var(--warn)}}
-.card.bad .bar i{{background:var(--bad)}}button{{font:inherit;font-size:13px;padding:3px 10px}}
+.card.bad .bar i{{background:var(--bad)}}button{{font:inherit;font-size:13px;font-weight:600;padding:7px 14px;border-radius:8px;border:1px solid var(--line);background:var(--btn);color:var(--fg);cursor:pointer;transition:filter .15s,border-color .15s}}button:hover{{filter:brightness(1.08);border-color:var(--muted)}}button:active{{transform:translateY(1px)}}button:disabled{{opacity:.55;cursor:default}}button:focus-visible{{outline:2px solid var(--accent);outline-offset:2px}}button.pri{{background:var(--accent);color:var(--accent-fg);border-color:var(--accent)}}#theme{{margin-left:auto;margin-right:8px;border-radius:999px;padding:5px 12px}}
 details{{margin-top:24px}}
 .live{{display:inline-flex;align-items:center;gap:8px;border:1px solid var(--line);
 background:var(--card);color:var(--fg);border-radius:999px;padding:5px 12px 5px 10px;
@@ -979,9 +980,9 @@ border:1px solid var(--line);border-radius:6px;padding:1px 6px;vertical-align:mi
 50%{{box-shadow:0 0 0 5px rgba(63,184,113,0)}}}}
 @media (prefers-reduced-motion:reduce){{.live.on .dot{{animation:none}}}}
 .scroll{{overflow-x:auto}}td.k{{white-space:nowrap}}
-td.k+td{{width:1%}}progress{{width:90px}}html,body{{overflow-x:hidden}}{SETTINGS_CSS}</style></head><body>
+td.k+td{{width:1%}}progress{{width:90px}}html,body{{overflow-x:hidden}}{SETTINGS_CSS}</style></head><body data-build='{e(installed_version())}'>
 <div class=row><h1>Plex-Cache <span class=ver>v{__version__}</span></h1>
-<button id=toggle class='live on' type=button aria-pressed=false
+<button id=theme type=button title="Switch light or dark mode">Auto</button><button id=toggle class='live on' type=button aria-pressed=false
 title="Pause or resume live updates"><span class=dot></span><b id=livetext>Live</b>
 <span class=sub id=updated></span></button></div>
 {'<nav class=tabs><a href="#status" data-tab=status>Status</a><a href="#settings" data-tab=settings>Settings</a></nav>' if settings else ''}
@@ -1016,6 +1017,39 @@ with --warm before watching, lower the quality in Plex, or give the cache more d
 {settings}
 <script>
 (function () {{
+  // Light, dark, or follow the system.
+  var themeBtn = document.getElementById("theme"), root = document.documentElement;
+  var themes = ["", "light", "dark"], names = {{"": "Auto", light: "Light", dark: "Dark"}};
+  function showTheme() {{ themeBtn.textContent = (root.dataset.theme === "dark" ? "\u263E " : root.dataset.theme === "light" ? "\u2600 " : "\u25D0 ") + names[root.dataset.theme || ""]; }}
+  themeBtn.onclick = function () {{
+    var t = themes[(themes.indexOf(root.dataset.theme || "") + 1) % 3];
+    if (t) root.dataset.theme = t; else delete root.dataset.theme;
+    try {{ t ? localStorage.setItem("plexcache-theme", t) : localStorage.removeItem("plexcache-theme"); }} catch (e) {{}}
+    showTheme();
+  }};
+  showTheme();
+  // After "Update now", wait for the new build to come up, then reload.
+  var build = document.body.dataset.build;
+  document.querySelectorAll("form[action='update/run']").forEach(function (f) {{
+    f.addEventListener("submit", function () {{
+      try {{ sessionStorage.setItem("plexcache-updating", JSON.stringify({{from: build, at: Date.now()}})); }} catch (e) {{}}
+    }});
+  }});
+  var waiting = null;
+  try {{ waiting = JSON.parse(sessionStorage.getItem("plexcache-updating") || "null"); }} catch (e) {{}}
+  if (waiting && waiting.from !== build) {{
+    try {{ sessionStorage.removeItem("plexcache-updating"); }} catch (e) {{}}
+  }} else if (waiting) {{
+    var poll = setInterval(function () {{
+      if (Date.now() - waiting.at > 180000) {{
+        clearInterval(poll); try {{ sessionStorage.removeItem("plexcache-updating"); }} catch (e) {{}}
+        return;
+      }}
+      fetch("api/status", {{cache: "no-store"}}).then(function (r) {{ return r.json(); }})
+        .then(function (d) {{ if (d.build && d.build !== waiting.from) location.reload(); }})
+        .catch(function () {{}});  // the page restarts during the update
+    }}, 3000);
+  }}
   var paused = false, last = Date.now(), failed = false;
   try {{ paused = localStorage.getItem("plexcache-paused") === "1"; }} catch (e) {{}}
   var btn = document.getElementById("toggle"), upd = document.getElementById("updated"),
@@ -1635,6 +1669,10 @@ UPDATE_REPO = "https://github.com/Maffewem/Plex-Cache"
 INSTALL_DIR = "/opt/plex-precache"
 
 
+# Browser tab icon (same picture as assets/plexcache.svg).
+FAVICON = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%231f2228'/%3E%3Cpath d='M14 18l18 14-18 14z' fill='%23e5a00d'/%3E%3Crect x='36' y='18' width='14' height='6' rx='2' fill='%23e5a00d' opacity='.55'/%3E%3Crect x='36' y='29' width='14' height='6' rx='2' fill='%23e5a00d' opacity='.8'/%3E%3Crect x='36' y='40' width='14' height='6' rx='2' fill='%23e5a00d'/%3E%3C/svg%3E"
+
+
 def installed_version() -> str:
     try:
         with open(os.path.join(INSTALL_DIR, "VERSION")) as f:
@@ -1853,7 +1891,7 @@ def render_settings(cfg: Config, token: str, msg: str | None, ok: bool,
 <form method=post action=settings/mount>{hidden}{mount}
 <label class=check><input type=checkbox name=restart value=now checked>
 Restart the mount now so changes apply (anything playing pauses for a few seconds)</label>
-<button>Save cache settings</button></form>
+<button class=pri>Save cache settings</button></form>
 <form method=post action=restart-mount class=inline>{hidden}
 <button>Restart mount only</button></form></div>""" if has_mount else ""
     conn_form = ""
@@ -1876,7 +1914,7 @@ Restart the mount now so changes apply (anything playing pauses for a few second
 {row("New SSH private key", "<textarea name=key rows=3 placeholder='Leave blank to keep the current key' spellcheck=false></textarea>",
      "Only needed if the server's key changed. Paste it again when saving after a test.")}
 <button name=do value=test>Test connection</button>
-<button name=do value=save>Test and save</button>
+<button class=pri name=do value=save>Test and save</button>
 <p class=muted>Saving tests the connection first and changes nothing if it fails. It then
 restarts the mount, so anything playing pauses for a few seconds; if the mount won't start,
 the previous settings are put back.</p></form>"""
@@ -1897,7 +1935,7 @@ The switch reads the server, folder and SSH key from the SSHFS mount, checks rcl
 same folders, then swaps the mounts. Plex paths don't change. Plex pauses for a moment, and if
 the new mount doesn't show your files, SSHFS is put back.</p>
 <form method=post action=switch/check class=inline>{hidden}<button>Test first</button></form>
-<form method=post action=switch/run class=inline>{hidden}<button>Switch now</button></form>
+<form method=post action=switch/run class=inline>{hidden}<button class=pri>Switch now</button></form>
 {note_html}</div>"""
     elif mm and mm["undo"] and mm["fstype"] != "fuse.rclone":
         # Only worth a panel when something is wrong; going back to SSHFS is
@@ -1910,7 +1948,7 @@ media. Check <code>journalctl -u plex-cache-mount</code>.</p>{note_html}</div>""
 <form method=post action=warm class=panel id=s-warm>{hidden}<h3>Pre-cache now</h3>
 {row("Folder or file", "<input name=path placeholder='TV/Some Show/Season 1' autocomplete=off>",
      "Path inside " + (env.get("MOUNTPOINT") or "the media folder") + ". Up to 500 files are queued.")}
-<button>Pre-cache</button></form>""" if has_mount else ""
+<button class=pri>Pre-cache</button></form>""" if has_mount else ""
     rec_form = f"""
 <form method=post action=settings/recommended class='panel recbox' id=s-rec>{hidden}
 <h3>Recommended settings</h3>
@@ -1921,7 +1959,7 @@ stream, drop files after {e(rec["mount"]["CACHE_MAX_AGE"])} unwatched,
 {e(rec["prefetch"]["next_episodes"])} upcoming episode(s), {e(rec["prefetch"]["workers"])}
 download(s) at once.</p>
 {'<label class=check><input type=checkbox name=restart value=now checked> Restart the mount now (anything playing pauses for a few seconds)</label>' if has_mount else ''}
-<button>Use recommended settings</button></form>""" if rec else ""
+<button class=pri>Use recommended settings</button></form>""" if rec else ""
     note = last_update_note()
     update_form = f"""
 <div class=panel id=s-update><h3>Updates</h3>
@@ -1929,7 +1967,7 @@ download(s) at once.</p>
 <span class=muted>· build {e(installed_version())}</span>
 {('<br><span class=muted>Last update: ' + e(note) + '</span>') if note else ''}</p>
 <form method=post action=update/check class=inline>{hidden}<button>Check for updates</button></form>
-<form method=post action=update/run class=inline>{hidden}<button>Update now</button></form>
+<form method=post action=update/run class=inline>{hidden}<button class=pri>Update now</button></form>
 <form method=post action=update/auto>{hidden}
 <label class=check><input type=checkbox name=auto_update{' checked' if cfg.auto_update else ''}
 onchange="this.form.submit()"> Install updates automatically each night</label>
@@ -1938,7 +1976,7 @@ onchange="this.form.submit()"> Install updates automatically each night</label>
 <a href="{UPDATE_REPO}/blob/main/CHANGELOG.md" target=_blank rel=noopener>What's new</a></p></div>"""
     return f"""<section id=settings><h2>Settings</h2>{banner}{rec_form}
 <form method=post action=settings/prefetch class=panel id=s-prefetch>{hidden}<h3>Pre-caching</h3>{pre}
-<button>Save pre-cache settings</button>
+<button class=pri>Save pre-cache settings</button>
 <span class=muted>Applies immediately.</span></form>
 {switch_form}{conn_form}{mount_form}{warm_form}{update_form}</section>"""
 
@@ -2000,6 +2038,7 @@ def start_status_server(cfg: Config, pf: Prefetcher) -> None:
         def do_GET(self):
             data = status_data(cfg, pf)
             if self.path.rstrip("/").endswith("/api/status"):
+                data = dict(data, build=installed_version())
                 self._send(json.dumps(data).encode(), "application/json")
                 return
             msg = last_msg.pop("text", None) if "saved=1" in self.path else None

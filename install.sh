@@ -222,6 +222,10 @@ if [ -f /install/.panel.lock ] && [ -d /opt/swizzin/core ]; then
   if ! grep -q "BEGIN plex-cache" "$PROFILES"; then
     cat swizzin/plexcache_profile.py >> "$PROFILES"
   fi
+  sed -i '/# BEGIN plex-cache/,/# END plex-cache/s/img = "plex"$/img = "plexcache"/' "$PROFILES"
+  if [ -d /opt/swizzin/core/static/img/apps ]; then
+    install -m 644 swizzin/plexcache.png /opt/swizzin/core/static/img/apps/plexcache.png
+  fi
   chown swizzin: "$PROFILES" 2>/dev/null || true
   touch /install/.plexcache.lock
   systemctl restart panel 2>/dev/null || true

@@ -35,6 +35,7 @@ if [ -f "$PROFILES" ] && grep -q "BEGIN plex-cache" "$PROFILES"; then
   sed -i '/# BEGIN plex-cache/,/# END plex-cache/d' "$PROFILES"
   systemctl restart panel 2>/dev/null
 fi
+rm -f /opt/swizzin/core/static/img/apps/plexcache.png
 rm -f /install/.plexcache.lock /etc/swizzin/scripts/remove/plexcache.sh
 rm -f /usr/local/bin/plex-cache-resize /usr/local/sbin/plex-cache-update /usr/local/sbin/plex-cache-switch /etc/sudoers.d/plex-cache
 rm -rf /opt/plex-precache

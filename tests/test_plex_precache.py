@@ -1,4 +1,5 @@
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -147,6 +148,9 @@ class StatusTests(unittest.TestCase):
             self.assertIn("&lt;i&gt;ep.mkv", page)
             self.assertIn("Show &amp; Co", page)
             self.assertIn("of 16G", page)
+            self.assertIn("<link rel=icon href=\"data:image/svg+xml,", page)
+            self.assertIn("id=theme", page)
+            self.assertIn("data-build=", page)
 
 
 def _stream(**kw):
@@ -612,6 +616,14 @@ class RcloneSettingsTests(unittest.TestCase):
         with mock.patch.object(pp.subprocess, "run", no_sudo):
             self.assertEqual(self.real_restart({self.env: old}), "no-restart")
         self.assertIn("--nonsense", open(self.env).read())
+
+
+class VersionTests(unittest.TestCase):
+    def test_changelog_matches_version(self):
+        path = os.path.join(os.path.dirname(__file__), "..", "CHANGELOG.md")
+        with open(path) as f:
+            top = re.search(r"^## (\S+)", f.read(), re.M).group(1)
+        self.assertEqual(top, pp.__version__)
 
 
 if __name__ == "__main__":
