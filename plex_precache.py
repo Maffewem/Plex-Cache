@@ -34,6 +34,9 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 
+__version__ = "1.1.0"
+__released__ = "2026-10-10"
+
 log = logging.getLogger("plex-precache")
 
 DEFAULTS = {
@@ -900,13 +903,14 @@ cursor:pointer;font-size:13px;line-height:1.2}}.live:hover{{border-color:var(--m
 .live .dot{{width:9px;height:9px;border-radius:50%;background:var(--good);flex:none}}
 .live.on .dot{{animation:pulse 2s ease-in-out infinite}}
 .live.paused .dot{{background:var(--muted)}}.live.offline .dot{{background:var(--bad)}}
-.live .sub{{color:var(--muted)}}
+.live .sub{{color:var(--muted)}}.ver{{font-size:13px;font-weight:500;color:var(--muted);
+border:1px solid var(--line);border-radius:6px;padding:1px 6px;vertical-align:middle}}
 @keyframes pulse{{0%,100%{{box-shadow:0 0 0 0 rgba(63,184,113,.6)}}
 50%{{box-shadow:0 0 0 5px rgba(63,184,113,0)}}}}
 @media (prefers-reduced-motion:reduce){{.live.on .dot{{animation:none}}}}
 .scroll{{overflow-x:auto}}td.k{{white-space:nowrap}}
 td.k+td{{width:1%}}progress{{width:90px}}html,body{{overflow-x:hidden}}{SETTINGS_CSS}</style></head><body>
-<div class=row><h1>Plex-Cache</h1>
+<div class=row><h1>Plex-Cache <span class=ver>v{__version__}</span></h1>
 <button id=toggle class='live on' type=button aria-pressed=false
 title="Pause or resume live updates"><span class=dot></span><b id=livetext>Live</b>
 <span class=sub id=updated></span></button></div>
@@ -1259,6 +1263,29 @@ def last_update_note() -> str:
         return ""
 
 
+def version_label(version: str = __version__, released: str = __released__) -> str:
+    """'1.1.0 (10 Oct 2026)'."""
+    try:
+        day = time.strftime("%-d %b %Y", time.strptime(released, "%Y-%m-%d"))
+    except ValueError:
+        return version
+    return f"{version} ({day})"
+
+
+def latest_release() -> tuple[str, str] | None:
+    """(version, released) of the newest version on GitHub, read from its source."""
+    url = UPDATE_REPO.replace("github.com", "raw.githubusercontent.com") + \
+        "/main/plex_precache.py"
+    try:
+        with urllib.request.urlopen(url, timeout=15) as resp:
+            head = resp.read(4096).decode("utf-8", "replace")
+    except OSError:
+        return None
+    v = re.search(r'^__version__ = "([^"]+)"', head, re.M)
+    r = re.search(r'^__released__ = "([^"]+)"', head, re.M)
+    return (v.group(1), r.group(1) if r else "") if v else None
+
+
 def check_for_update() -> str:
     try:
         out = subprocess.run(["git", "ls-remote", UPDATE_REPO, "refs/heads/main"],
@@ -1268,10 +1295,12 @@ def check_for_update() -> str:
     latest = out[:7]
     if not latest:
         raise SettingsError("Couldn't reach GitHub to check for updates.")
-    current = installed_version()
-    if latest == current:
-        return f"You're on the latest version ({current})."
-    return f"Version {latest} is available (you have {current}). Use Update now to install it."
+    if latest == installed_version():
+        return f"You're on the latest version, {version_label()}."
+    rel = latest_release()
+    name = f"Version {version_label(*rel)}" if rel and rel[0] != __version__ else \
+        f"A newer build ({latest})"
+    return f"{name} is available; you have {version_label()}. Use Update now to install it."
 
 
 def start_update() -> str:
@@ -1376,7 +1405,8 @@ download(s) at once.</p>
     note = last_update_note()
     update_form = f"""
 <div class=panel><h3>Updates</h3>
-<p>Installed version: <b>{e(installed_version())}</b>
+<p>Version <b>{e(version_label())}</b>
+<span class=muted>· build {e(installed_version())}</span>
 {('<br><span class=muted>Last update: ' + e(note) + '</span>') if note else ''}</p>
 <form method=post action=update/check class=inline>{hidden}<button>Check for updates</button></form>
 <form method=post action=update/run class=inline>{hidden}<button>Update now</button></form>
@@ -1384,7 +1414,8 @@ download(s) at once.</p>
 <label class=check><input type=checkbox name=auto_update{' checked' if cfg.auto_update else ''}
 onchange="this.form.submit()"> Install updates automatically each night</label>
 <noscript><button>Save</button></noscript></form>
-<p class=muted>Updates keep all your settings. Over SSH: <code>sudo plex-cache-update</code>.</p></div>"""
+<p class=muted>Updates keep all your settings. Over SSH: <code>sudo plex-cache-update</code>.
+<a href="{UPDATE_REPO}/blob/main/CHANGELOG.md" target=_blank rel=noopener>What's new</a></p></div>"""
     return f"""<section id=settings><h2>Settings</h2>{banner}{rec_form}
 <form method=post action=settings/prefetch class=panel>{hidden}<h3>Pre-caching</h3>{pre}
 <button>Save pre-cache settings</button>
@@ -1511,6 +1542,8 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("-v", "--verbose", action="store_true")
     ap.add_argument("--warm", nargs="+", metavar="PATH",
                     help="cache these files/directories now and exit")
+    ap.add_argument("--version", action="version",
+                    version=f"Plex-Cache {version_label()}")
     ap.add_argument("--recommend", metavar="CACHE_DIR",
                     help="print settings suited to this server as KEY=VALUE lines and exit")
     args = ap.parse_args(argv)

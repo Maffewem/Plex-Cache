@@ -25,15 +25,17 @@ case "${1:-}" in
   *) echo "unknown option: $1" >&2; exit 1 ;;
 esac
 
+ver_of() { sed -n 's/^__version__ = "\(.*\)"$/\1/p' "$1" 2>/dev/null | head -1; }
 current="$(cat "$VERSION_FILE" 2>/dev/null || echo unknown)"
+current_v="$(ver_of /opt/plex-precache/plex_precache.py)"
 latest="$(git ls-remote "$REPO" "refs/heads/$BRANCH" 2>/dev/null | cut -c1-7)"
 [ -n "$latest" ] || { echo "Couldn't reach $REPO to check for updates." >&2; exit 1; }
 
 if [ "$MODE" = check ]; then
   if [ "$current" = "$latest" ]; then
-    echo "Up to date ($current)."
+    echo "Up to date: ${current_v:-?} (build $current)."
   else
-    echo "Update available: $current -> $latest."
+    echo "Update available: you have ${current_v:-?} (build $current); newest build is $latest."
   fi
   exit 0
 fi
@@ -50,7 +52,7 @@ note() {  # result line shown on the status page
 }
 
 if [ "$current" = "$latest" ]; then
-  note "Already up to date ($current)."
+  note "Already up to date: ${current_v:-?} (build $current)."
   exit 0
 fi
 
@@ -74,7 +76,8 @@ if ! "$SRC/install.sh" --update; then
 fi
 after="$(sha256sum "$MOUNT_UNIT" 2>/dev/null || true)"
 
-msg="Updated $current -> $latest."
+new_v="$(ver_of "$SRC/plex_precache.py")"
+msg="Updated ${current_v:-?} -> ${new_v:-?} (build $latest)."
 if [ "$before" != "$after" ] && systemctl is-active --quiet plex-cache-mount; then
   # Restarting the mount would interrupt playback, so leave that to the user.
   msg="$msg Mount changes apply the next time the mount restarts."
