@@ -132,8 +132,17 @@ The bottom of the status page has a **Settings** section:
   Plex.
 - **Cache** (restarts the mount, so playback pauses for a few seconds): cache
   size as a fixed amount or a % of usable disk, disk to keep free, how long
-  unwatched files are kept, read-ahead and RAM buffer per stream. There's
-  also a restart-only button.
+  unwatched files are kept, read-ahead and RAM buffer per stream. Under
+  **Advanced rclone settings**: chunk size, how long folder listings are
+  trusted, and extra rclone mount flags such as `--bwlimit 80M`. If the mount
+  won't start after a change, the previous settings are put back
+  automatically. There's also a restart-only button.
+- **Connection to your media server**: server, user, SSH port, folder on the
+  server, where it's mounted, and optionally a new SSH key. **Test connection**
+  lists the folder with the new details without changing anything; **Test and
+  save** only saves if that test passes, then restarts the mount. This works
+  for the SFTP connection `install.sh --sftp` set up; any other remote is
+  shown but changed with `rclone config`.
 - **Pre-cache now**: queue a folder or file under the media folder, such as a
   season you're about to watch (up to 500 files at a time).
 
@@ -142,9 +151,10 @@ The bottom of the status page has a **Settings** section:
 - **Updates**: shows the installed version, checks GitHub, installs the latest
   version, and turns on nightly automatic updates.
 
-The Plex token, remote and mount location stay command-line only. To make the
-page work, the installer gives the service user ownership of
-`/etc/plex-precache/config.ini` and `rclone-mount.env`. It also adds a sudo rule
+The Plex token stays command-line only. To make the page work, the installer
+gives the service user (which also runs the mount) ownership of
+`/etc/plex-precache/config.ini`, `rclone-mount.env`, `rclone.conf` and the
+copied SSH key. It also adds a sudo rule
 (`/etc/sudoers.d/plex-cache`) that lets that user run exactly
 `systemctl restart plex-cache-mount` and `systemctl restart plex-precache`, and
 nothing else. Forms carry a per-run token, so other websites can't submit them

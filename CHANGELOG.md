@@ -20,6 +20,11 @@ The version is shown on the status page (`/plexcache/`) and by
 - Downloads stop once nobody has watched the stream for 10 minutes
   (adjustable).
 - `plex-cache-resize --max-age` sets how long unwatched files stay cached.
+- The SFTP connection (server, user, port, folder, mount location, SSH key)
+  and advanced rclone settings can be changed from the status page. Changes
+  are tested first and rolled back if the mount won't start.
+- Fix: an `EXTRA_ARGS` value with spaces broke the installer and
+  `plex-cache-resize`; values are now quoted, and updates fix existing files.
 
 ## 1.0.0 (10 Oct 2026)
 

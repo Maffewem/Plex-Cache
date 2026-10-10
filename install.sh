@@ -106,13 +106,20 @@ if [ "$WITH_MOUNT" -eq 1 ]; then
     sed "s|/home/USER/|/home/$RUN_USER/|" systemd/rclone-mount.env.example > /etc/plex-precache/rclone-mount.env
     NEW_ENV=1
   fi
-  set_env() {  # key value
+  set_env() {  # key value; values with spaces are quoted so bash can source the file
+    local v="$2"
+    case "$v" in *[[:space:]]*) v="\"$v\"" ;; esac
     if grep -q "^$1=" /etc/plex-precache/rclone-mount.env; then
-      sed -i "s|^$1=.*|$1=$2|" /etc/plex-precache/rclone-mount.env
+      sed -i "s|^$1=.*|$1=$v|" /etc/plex-precache/rclone-mount.env
     else
-      echo "$1=$2" >> /etc/plex-precache/rclone-mount.env
+      echo "$1=$v" >> /etc/plex-precache/rclone-mount.env
     fi
   }
+  # Earlier versions wrote EXTRA_ARGS=--flag value unquoted, which breaks sourcing.
+  sed -i -E 's/^([A-Z_]+)=([^"].*[[:space:]].*)$/\1="\2"/' /etc/plex-precache/rclone-mount.env
+  # Settings added in later versions.
+  grep -q '^VFS_CHUNK_SIZE=' /etc/plex-precache/rclone-mount.env || set_env VFS_CHUNK_SIZE 64M
+  grep -q '^DIR_CACHE_TIME=' /etc/plex-precache/rclone-mount.env || set_env DIR_CACHE_TIME 1h
   if [ -n "$SFTP" ]; then
     # Same server, user, key and path as the SSHFS mount, but through rclone so
     # reads land in the local cache. Kept in its own config, not the user's.
