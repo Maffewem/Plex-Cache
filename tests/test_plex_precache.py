@@ -319,5 +319,43 @@ class MountTests(unittest.TestCase):
         self.assertIn("Media mount", titles)
 
 
+class RecommendTests(unittest.TestCase):
+    def test_small_box(self):
+        gb = 1024 ** 3
+        rec = pp.recommend_settings("/", mem=int(7.75 * gb), cpus=4,
+                                    disk=(int(67.66 * gb), int(38.12 * gb)), cached=0)
+        self.assertEqual(rec["mount"], {"CACHE_PERCENT": "60", "CACHE_MAX_SIZE": "18G",
+                                        "CACHE_MIN_FREE": "7G", "CACHE_MAX_AGE": "72h",
+                                        "READ_AHEAD": "1G", "BUFFER_SIZE": "128M"})
+        self.assertEqual(rec["prefetch"], {"next_episodes": "1", "workers": "2",
+                                           "min_free_gb": "7"})
+
+    def test_big_and_tiny_boxes_stay_in_bounds(self):
+        gb = 1024 ** 3
+        big = pp.recommend_settings("/", mem=64 * gb, cpus=16, disk=(4000 * gb, 3000 * gb),
+                                    cached=0)["mount"]
+        self.assertEqual((big["CACHE_MIN_FREE"], big["BUFFER_SIZE"], big["READ_AHEAD"],
+                          big["CACHE_MAX_AGE"]), ("20G", "512M", "4G", "14d"))
+        tiny = pp.recommend_settings("/", mem=1 * gb, cpus=1, disk=(10 * gb, 3 * gb),
+                                     cached=0)
+        self.assertEqual(tiny["mount"]["CACHE_MAX_SIZE"], "5G")
+        self.assertEqual(tiny["mount"]["BUFFER_SIZE"], "32M")
+        self.assertEqual(tiny["prefetch"]["workers"], "1")
+
+    def test_settings_page_has_recommendations_and_updates(self):
+        with tempfile.TemporaryDirectory() as d:
+            ini = os.path.join(d, "config.ini")
+            with open(ini, "w") as f:
+                f.write("[plex]\nworkers = 2\n")
+            cfg = pp.Config(ini)
+            cfg.cache_dir, cfg.mount_env = d, os.path.join(d, "missing.env")
+            page = pp.render_settings(cfg, "tok", None, True)
+            self.assertIn("Use recommended settings", page)
+            self.assertIn("Recommended for this server", page)
+            self.assertIn("action=update/run", page)
+            self.assertIn("Automatic updates on", pp.set_auto_update(cfg, {"auto_update": "on"}))
+            self.assertTrue(pp.Config(ini).auto_update)
+
+
 if __name__ == "__main__":
     unittest.main()

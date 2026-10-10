@@ -20,6 +20,7 @@ import http.server
 import itertools
 import json
 import logging
+import math
 import os
 import re
 import secrets
@@ -54,6 +55,7 @@ DEFAULTS = {
     "status_port": "8789",
     "mount_env": "/etc/plex-precache/rclone-mount.env",
     "require_cache_mount": "true",
+    "auto_update": "false",
 }
 
 # Lower number runs first.
@@ -93,6 +95,7 @@ class Config:
         self.status_port = s.getint("status_port")
         self.mount_env = s.get("mount_env")
         self.require_cache_mount = s.getboolean("require_cache_mount")
+        self.auto_update = s.getboolean("auto_update")
         # Longest prefix first so nested mappings win.
         self.path_map = sorted(cp["path_map"].items(), key=lambda kv: -len(kv[0]))
 
@@ -843,10 +846,24 @@ var(--info);border-radius:6px;padding:10px 12px;margin:8px 0}}.card p{{margin:6p
 .bar{{height:6px;background:var(--line);border-radius:3px;margin-top:8px;overflow:hidden}}
 .bar i{{display:block;height:100%;background:var(--good)}}.card.warn .bar i{{background:var(--warn)}}
 .card.bad .bar i{{background:var(--bad)}}button{{font:inherit;font-size:13px;padding:3px 10px}}
-details{{margin-top:24px}}.scroll{{overflow-x:auto}}td.k{{white-space:nowrap}}
+details{{margin-top:24px}}
+.live{{display:inline-flex;align-items:center;gap:8px;border:1px solid var(--line);
+background:var(--card);color:var(--fg);border-radius:999px;padding:5px 12px 5px 10px;
+cursor:pointer;font-size:13px;line-height:1.2}}.live:hover{{border-color:var(--muted)}}
+.live:focus-visible{{outline:2px solid var(--info);outline-offset:2px}}
+.live .dot{{width:9px;height:9px;border-radius:50%;background:var(--good);flex:none}}
+.live.on .dot{{animation:pulse 2s ease-in-out infinite}}
+.live.paused .dot{{background:var(--muted)}}.live.offline .dot{{background:var(--bad)}}
+.live .sub{{color:var(--muted)}}
+@keyframes pulse{{0%,100%{{box-shadow:0 0 0 0 rgba(63,184,113,.6)}}
+50%{{box-shadow:0 0 0 5px rgba(63,184,113,0)}}}}
+@media (prefers-reduced-motion:reduce){{.live.on .dot{{animation:none}}}}
+.scroll{{overflow-x:auto}}td.k{{white-space:nowrap}}
 td.k+td{{width:1%}}progress{{width:90px}}html,body{{overflow-x:hidden}}{SETTINGS_CSS}</style></head><body>
-<div class=row><h1>Plex-Cache</h1><span class=muted><span id=updated></span>
-<button id=toggle type=button>Pause</button></span></div>
+<div class=row><h1>Plex-Cache</h1>
+<button id=toggle class='live on' type=button aria-pressed=false
+title="Pause or resume live updates"><span class=dot></span><b id=livetext>Live</b>
+<span class=sub id=updated></span></button></div>
 <div id=main>
 <div class='verdict {overall}'>{e(verdict)}</div>
 <div class=stats><div><b>{_gb(c['used'])}</b><span class=muted>cached
@@ -878,12 +895,16 @@ with --warm before watching, lower the quality in Plex, or give the cache more d
 (function () {{
   var paused = false, last = Date.now(), failed = false;
   try {{ paused = localStorage.getItem("plexcache-paused") === "1"; }} catch (e) {{}}
-  var btn = document.getElementById("toggle"), upd = document.getElementById("updated");
+  var btn = document.getElementById("toggle"), upd = document.getElementById("updated"),
+      txt = document.getElementById("livetext");
   function label() {{
-    btn.textContent = paused ? "Resume" : "Pause";
     var s = Math.round((Date.now() - last) / 1000);
-    upd.textContent = (failed ? "Can't reach the server · " : "") +
-      (paused ? "Live updates paused · " : "") + "updated " + (s < 2 ? "just now" : s + "s ago");
+    var ago = s < 2 ? "just now" : s < 120 ? s + "s ago" : Math.round(s / 60) + " min ago";
+    var state = paused ? "paused" : failed ? "offline" : "on";
+    btn.className = "live " + state;
+    btn.setAttribute("aria-pressed", paused ? "true" : "false");
+    txt.textContent = paused ? "Paused" : failed ? "Reconnecting" : "Live";
+    upd.textContent = paused ? "tap to resume" : "updated " + ago;
   }}
   btn.onclick = function () {{
     paused = !paused;
@@ -943,6 +964,75 @@ DURATION_RE = re.compile(r"^\d+[smhdwMy]$")
 
 class SettingsError(ValueError):
     pass
+
+
+GB = 1024 * MB
+
+
+def mem_total() -> int | None:
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    return int(line.split()[1]) * 1024
+    except OSError:
+        pass
+    return None
+
+
+def _size_str(n: int) -> str:
+    mb = max(1, n // MB)
+    return f"{mb // 1024}G" if mb % 1024 == 0 else f"{mb}M"
+
+
+def _nearest_pow2_mb(n: float, lo: int, hi: int) -> int:
+    """Clamp to [lo, hi] bytes and snap to the nearest power-of-two MB."""
+    mb = max(lo, min(hi, n)) / MB
+    return int(2 ** round(math.log2(max(mb, 1)))) * MB
+
+
+def recommend_settings(cache_dir: str, mem: int | None = None, cpus: int | None = None,
+                       disk: tuple[int, int] | None = None, cached: int | None = None) -> dict:
+    """Settings that suit this server's disk, RAM and CPU.
+
+    disk is (total, free) bytes for the cache disk; cached is what the cache
+    already holds (it counts as usable, since rclone can reuse it).
+    """
+    if disk is None:
+        du = shutil.disk_usage(cache_dir)
+        disk = (du.total, du.free)
+    if cached is None:
+        cached = dir_usage(cache_dir) or 0
+    mem = mem or mem_total() or 4 * GB
+    cpus = cpus or os.cpu_count() or 2
+    total, free = disk
+
+    # Keep 10% of the disk free, between 5 and 20 GB, for the OS, Plex and transcodes.
+    floor = round(max(5 * GB, min(20 * GB, total * 0.10)) / GB) * GB
+    cache = max(5 * GB, int((free + cached - floor) * 0.60) // GB * GB)
+    # About 1/64 of RAM per stream: ~128M on 8 GB, ~512M on 32 GB.
+    buffer = _nearest_pow2_mb(mem / 64, 32 * MB, 512 * MB)
+    # Read ahead up to 1/16 of the cache, so a few streams can't fill it.
+    read_ahead = _nearest_pow2_mb(cache / 16, 256 * MB, 4 * GB)
+    max_age = "72h" if cache < 50 * GB else "7d" if cache < 200 * GB else "14d"
+    return {
+        "mount": {
+            "CACHE_PERCENT": "60",
+            "CACHE_MAX_SIZE": _size_str(cache),
+            "CACHE_MIN_FREE": _size_str(floor),
+            "CACHE_MAX_AGE": max_age,
+            "READ_AHEAD": _size_str(read_ahead),
+            "BUFFER_SIZE": _size_str(buffer),
+        },
+        "prefetch": {
+            # Each upcoming episode can be several GB; keep them within the cache.
+            "next_episodes": "1" if cache < 30 * GB else "2" if cache < 80 * GB else "3",
+            "workers": "1" if cpus <= 2 else "2",
+            "min_free_gb": str(floor // GB),
+        },
+        "basis": (f"{_gb(total)} disk with {_gb(free)} free, {_gb(mem)} RAM, "
+                  f"{cpus} CPU cores"),
+    }
 
 
 def validate_prefetch(form: dict) -> dict:
@@ -1076,6 +1166,85 @@ def apply_mount_settings(cfg: Config, form: dict) -> str:
             "the mount restarts.")
 
 
+def apply_recommended(cfg: Config, pf: "Prefetcher", form: dict) -> str:
+    rec = recommend_settings(cfg.cache_dir)
+    pre = {key: str(getattr_current(cfg, key)) for key, *_ in PREFETCH_FIELDS}
+    pre.update({k: v for k, v in rec["prefetch"].items() if k in pre})
+    apply_prefetch_settings(cfg, pf, pre)
+    if read_env_file(cfg.mount_env):
+        return apply_mount_settings(cfg, {**rec["mount"], "restart": form.get("restart", "")}
+                                    ).replace("Cache settings", "Recommended settings")
+    update_ini(cfg.path, {"min_free_gb": rec["prefetch"]["min_free_gb"]})
+    reload_config(cfg)
+    return "Recommended settings saved and applied."
+
+
+def getattr_current(cfg: Config, key: str):
+    """A [plex] setting's current value, in the units the config file uses."""
+    return {
+        "next_episodes": cfg.next_episodes, "next_episode_head_mb": cfg.next_episode_head // MB,
+        "on_deck": "true" if cfg.on_deck else "", "on_deck_limit": cfg.on_deck_limit,
+        "on_deck_head_mb": cfg.on_deck_head // MB, "workers": cfg.workers,
+        "poll_interval": int(cfg.poll_interval), "remember_hours": int(cfg.remember / 3600),
+    }[key]
+
+
+UPDATE_REPO = "https://github.com/Maffewem/Plex-Cache"
+INSTALL_DIR = "/opt/plex-precache"
+
+
+def installed_version() -> str:
+    try:
+        with open(os.path.join(INSTALL_DIR, "VERSION")) as f:
+            return f.read().strip() or "unknown"
+    except OSError:
+        return "unknown"
+
+
+def last_update_note() -> str:
+    try:
+        with open(os.path.join(INSTALL_DIR, "last-update")) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def check_for_update() -> str:
+    try:
+        out = subprocess.run(["git", "ls-remote", UPDATE_REPO, "refs/heads/main"],
+                             capture_output=True, text=True, timeout=30).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        out = ""
+    latest = out[:7]
+    if not latest:
+        raise SettingsError("Couldn't reach GitHub to check for updates.")
+    current = installed_version()
+    if latest == current:
+        return f"You're on the latest version ({current})."
+    return f"Version {latest} is available (you have {current}). Use Update now to install it."
+
+
+def start_update() -> str:
+    try:
+        ok = subprocess.run(["sudo", "-n", "systemctl", "start", "--no-block",
+                             "plex-cache-update"], stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL, timeout=30).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        ok = False
+    if not ok:
+        raise SettingsError("Couldn't start the update from here. Run: sudo plex-cache-update")
+    return ("Updating in the background. This page will say Reconnecting for a few seconds "
+            "while Plex-Cache restarts; reload it afterwards to see the new version.")
+
+
+def set_auto_update(cfg: Config, form: dict) -> str:
+    on = form.get("auto_update") in ("on", "true", "1")
+    update_ini(cfg.path, {"auto_update": "true" if on else "false"})
+    reload_config(cfg)
+    return ("Automatic updates on: new versions install around 04:30 each night."
+            if on else "Automatic updates off.")
+
+
 def warm_path(cfg: Config, pf: "Prefetcher", rel: str) -> str:
     """Queue a file or folder under the mount for pre-caching."""
     root = read_env_file(cfg.mount_env).get("MOUNTPOINT") or ""
@@ -1098,16 +1267,20 @@ def render_settings(cfg: Config, token: str, msg: str | None, ok: bool) -> str:
     env = read_env_file(cfg.mount_env) if cfg.mount_env else {}
     has_mount = bool(env)
 
-    def row(label: str, field: str, help_: str) -> str:
+    try:
+        rec = recommend_settings(cfg.cache_dir) if cfg.cache_dir and os.path.isdir(
+            cfg.cache_dir) else None
+    except OSError:
+        rec = None
+    rec_all = {**rec["mount"], **rec["prefetch"]} if rec else {}
+
+    def row(label: str, field: str, help_: str, key: str = "") -> str:
         hint = f"<div class=muted>{e(help_)}</div>" if help_ else ""
+        if key in rec_all and key != "CACHE_PERCENT":
+            hint += f"<div class=rec>Recommended for this server: {e(rec_all[key])}</div>"
         return f"<label class=field><span>{e(label)}</span>{field}{hint}</label>"
 
-    current = {
-        "next_episodes": cfg.next_episodes, "next_episode_head_mb": cfg.next_episode_head // MB,
-        "on_deck": cfg.on_deck, "on_deck_limit": cfg.on_deck_limit,
-        "on_deck_head_mb": cfg.on_deck_head // MB, "workers": cfg.workers,
-        "poll_interval": int(cfg.poll_interval), "remember_hours": int(cfg.remember / 3600),
-    }
+    current = {key: getattr_current(cfg, key) for key, *_ in PREFETCH_FIELDS}
     pre = ""
     for key, label, kind, lo, hi, help_ in PREFETCH_FIELDS:
         if kind == "bool":
@@ -1116,14 +1289,14 @@ def render_settings(cfg: Config, token: str, msg: str | None, ok: bool) -> str:
         else:
             field = (f"<input type=number name={key} min={lo} max={hi} required "
                      f"value='{current[key]}'>")
-        pre += row(label, field, help_)
+        pre += row(label, field, help_, key)
     mount = ""
     if has_mount:
         for key, label, kind, help_ in MOUNT_FIELDS:
             field = (f"<input name={key} value='{e(env.get(key, ''))}' "
                      f"{'inputmode=numeric ' if kind == 'percent' else ''}"
                      f"autocomplete=off spellcheck=false>")
-            mount += row(label, field, help_)
+            mount += row(label, field, help_, key)
     banner = (f"<p class='notice {'good' if ok else 'bad'}'>{e(msg)}</p>" if msg else "")
     hidden = f"<input type=hidden name=token value='{token}'>"
     mount_form = f"""
@@ -1139,11 +1312,34 @@ Restart the mount now so changes apply (anything playing pauses for a few second
 {row("Folder or file", "<input name=path placeholder='TV/Some Show/Season 1' autocomplete=off>",
      "Path inside " + (env.get("MOUNTPOINT") or "the media folder") + ". Up to 500 files are queued.")}
 <button>Pre-cache</button></form>""" if has_mount else ""
-    return f"""<section id=settings><h2>Settings</h2>{banner}
+    rec_form = f"""
+<form method=post action=settings/recommended class='panel recbox'>{hidden}
+<h3>Recommended settings</h3>
+<p class=muted>Worked out from this server: {e(rec["basis"])}. Cache
+{e(rec["mount"]["CACHE_MAX_SIZE"])} (60% of usable disk), keep {e(rec["mount"]["CACHE_MIN_FREE"])}
+free, {e(rec["mount"]["BUFFER_SIZE"])} RAM and {e(rec["mount"]["READ_AHEAD"])} read-ahead per
+stream, drop files after {e(rec["mount"]["CACHE_MAX_AGE"])} unwatched,
+{e(rec["prefetch"]["next_episodes"])} upcoming episode(s), {e(rec["prefetch"]["workers"])}
+download(s) at once.</p>
+{'<label class=check><input type=checkbox name=restart value=now checked> Restart the mount now (anything playing pauses for a few seconds)</label>' if has_mount else ''}
+<button>Use recommended settings</button></form>""" if rec else ""
+    note = last_update_note()
+    update_form = f"""
+<div class=panel><h3>Updates</h3>
+<p>Installed version: <b>{e(installed_version())}</b>
+{('<br><span class=muted>Last update: ' + e(note) + '</span>') if note else ''}</p>
+<form method=post action=update/check class=inline>{hidden}<button>Check for updates</button></form>
+<form method=post action=update/run class=inline>{hidden}<button>Update now</button></form>
+<form method=post action=update/auto>{hidden}
+<label class=check><input type=checkbox name=auto_update{' checked' if cfg.auto_update else ''}
+onchange="this.form.submit()"> Install updates automatically each night</label>
+<noscript><button>Save</button></noscript></form>
+<p class=muted>Updates keep all your settings. Over SSH: <code>sudo plex-cache-update</code>.</p></div>"""
+    return f"""<section id=settings><h2>Settings</h2>{banner}{rec_form}
 <form method=post action=settings/prefetch class=panel>{hidden}<h3>Pre-caching</h3>{pre}
 <button>Save pre-cache settings</button>
 <span class=muted>Applies immediately.</span></form>
-{mount_form}{warm_form}</section>"""
+{mount_form}{warm_form}{update_form}</section>"""
 
 
 SETTINGS_CSS = """
@@ -1153,7 +1349,8 @@ SETTINGS_CSS = """
 .field input:not([type=checkbox]){font:inherit;padding:5px 8px;width:100%;max-width:260px;
 box-sizing:border-box;background:var(--bg);color:var(--fg);border:1px solid var(--line);
 border-radius:4px}.check{display:block;margin:10px 0;font-size:14px}
-#settings button{margin-top:6px}.inline{display:inline}
+#settings button{margin-top:6px}.rec{color:var(--info);font-size:13px}
+.recbox{border-left:4px solid var(--info)}.inline{display:inline}
 .notice{padding:8px 12px;border-radius:6px;color:#fff}.notice.good{background:var(--good)}
 .notice.bad{background:var(--bad)}"""
 
@@ -1194,6 +1391,14 @@ def start_status_server(cfg: Config, pf: Prefetcher) -> None:
                     text = apply_prefetch_settings(cfg, pf, form)
                 elif action == ["settings", "mount"]:
                     text = apply_mount_settings(cfg, form)
+                elif action == ["settings", "recommended"]:
+                    text = apply_recommended(cfg, pf, form)
+                elif action == ["update", "check"]:
+                    text = check_for_update()
+                elif action == ["update", "run"]:
+                    text = start_update()
+                elif action == ["update", "auto"]:
+                    text = set_auto_update(cfg, form)
                 elif action[-1] == "restart-mount":
                     text = ("Mount restarted." if systemctl_restart("plex-cache-mount") else
                             "Couldn't restart the mount from here. "
@@ -1256,7 +1461,14 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("-v", "--verbose", action="store_true")
     ap.add_argument("--warm", nargs="+", metavar="PATH",
                     help="cache these files/directories now and exit")
+    ap.add_argument("--recommend", metavar="CACHE_DIR",
+                    help="print settings suited to this server as KEY=VALUE lines and exit")
     args = ap.parse_args(argv)
+    if args.recommend:
+        rec = recommend_settings(args.recommend)
+        for k, v in {**rec["mount"], **rec["prefetch"]}.items():
+            print(f"{k}={v}")
+        return
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s")
     # The default config path is optional; an explicit -c must exist.

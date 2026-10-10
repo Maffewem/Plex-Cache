@@ -137,6 +137,11 @@ The bottom of the status page has a **Settings** section:
 - **Pre-cache now**: queue a folder or file under the media folder, such as a
   season you're about to watch (up to 500 files at a time).
 
+- **Recommended settings**: every field shows the value suggested for this
+  server, and one button applies them all (see [Auto-tuning](#auto-tuning)).
+- **Updates**: shows the installed version, checks GitHub, installs the latest
+  version, and turns on nightly automatic updates.
+
 The Plex token, remote and mount location stay command-line only. To make the
 page work, the installer gives the service user ownership of
 `/etc/plex-precache/config.ini` and `rclone-mount.env`. It also adds a sudo rule
@@ -147,6 +152,40 @@ through your browser, and every value is checked before it's written.
 
 `sudo box remove plexcache` (or `/opt/plex-precache/uninstall.sh`) removes it all;
 add `--purge` to the uninstall script to also delete the config and cached files.
+
+### Auto-tuning
+
+A fresh install sizes everything to the server, and the status page can
+re-apply this at any time with **Use recommended settings**:
+
+| Setting | Rule | 8 GB RAM, 68 GB disk with 38 GB free |
+|---|---|---|
+| Keep free | 10% of the disk, between 5 and 20 GB | 7G |
+| Cache size | 60% of free disk after that | 18G |
+| RAM buffer per stream | about 1/64 of RAM, 32M to 512M | 128M |
+| Read ahead | about 1/16 of the cache, 256M to 4G | 1G |
+| Drop unwatched after | 72h, or 7d/14d for caches over 50/200 GB | 72h |
+| Upcoming episodes | 1, 2 or 3 depending on cache size | 1 |
+| Downloads at once | 1 on 1 to 2 CPU cores, else 2 | 2 |
+
+`python3 /opt/plex-precache/plex_precache.py --recommend /var/cache/plex-cache`
+prints the values without changing anything.
+
+### Updating
+
+```bash
+sudo plex-cache-update           # install the latest version, keeping all settings
+plex-cache-update --check        # just check
+```
+
+You can also use **Update now** on the status page. Ticking **Install updates
+automatically each night** sets `auto_update = true`, and a timer then updates
+around 04:30. The updater keeps its own root-owned copy of this repo in
+`/opt/plex-precache/src` and re-runs the installer in update mode, which
+refreshes the program files but leaves config, cache size and mount settings
+alone. If an update changes the mount's own unit file, the change waits for the
+next mount restart so playback isn't interrupted. Only commits on this repo's
+`main` branch are ever installed.
 
 ### Cache size
 

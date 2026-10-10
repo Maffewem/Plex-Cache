@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# Update Plex-Cache to the latest version on GitHub, keeping all settings.
+#
+#   sudo plex-cache-update           # update now
+#   plex-cache-update --check        # say whether a newer version exists
+#
+# --auto is what the nightly timer runs: it only updates when auto_update = true
+# in /etc/plex-precache/config.ini. The status page's Update button starts the
+# plex-cache-update service, which runs this script.
+set -euo pipefail
+
+REPO=${PLEX_CACHE_REPO:-https://github.com/Maffewem/Plex-Cache}
+BRANCH=${PLEX_CACHE_BRANCH:-main}
+SRC=/opt/plex-precache/src
+CONFIG=/etc/plex-precache/config.ini
+VERSION_FILE=/opt/plex-precache/VERSION
+STATUS_FILE=/opt/plex-precache/last-update
+
+MODE=update
+case "${1:-}" in
+  --check) MODE=check ;;
+  --auto) MODE=auto ;;
+  -h|--help) sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  "") ;;
+  *) echo "unknown option: $1" >&2; exit 1 ;;
+esac
+
+current="$(cat "$VERSION_FILE" 2>/dev/null || echo unknown)"
+latest="$(git ls-remote "$REPO" "refs/heads/$BRANCH" 2>/dev/null | cut -c1-7)"
+[ -n "$latest" ] || { echo "Couldn't reach $REPO to check for updates." >&2; exit 1; }
+
+if [ "$MODE" = check ]; then
+  if [ "$current" = "$latest" ]; then
+    echo "Up to date ($current)."
+  else
+    echo "Update available: $current -> $latest."
+  fi
+  exit 0
+fi
+
+[ "$(id -u)" -eq 0 ] || { echo "run as root (sudo)" >&2; exit 1; }
+
+if [ "$MODE" = auto ] && ! grep -qiE '^auto_update *= *(true|yes|on|1)' "$CONFIG" 2>/dev/null; then
+  exit 0
+fi
+
+note() {  # result line shown on the status page
+  printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M')" "$1" > "$STATUS_FILE"
+  echo "$1"
+}
+
+if [ "$current" = "$latest" ]; then
+  note "Already up to date ($current)."
+  exit 0
+fi
+
+# A root-owned copy of the repo, so nothing the service user can write ends
+# up being run as root.
+if [ -d "$SRC/.git" ]; then
+  git -C "$SRC" fetch -q --depth 1 origin "$BRANCH"
+  git -C "$SRC" reset -q --hard FETCH_HEAD
+else
+  rm -rf "$SRC"
+  git clone -q --depth 1 --branch "$BRANCH" "$REPO" "$SRC"
+fi
+chown -R root:root "$SRC"
+chmod -R go-w "$SRC"
+
+MOUNT_UNIT=/etc/systemd/system/plex-cache-mount.service
+before="$(sha256sum "$MOUNT_UNIT" 2>/dev/null || true)"
+if ! "$SRC/install.sh" --update; then
+  note "Update to $latest failed; see: journalctl -u plex-cache-update"
+  exit 1
+fi
+after="$(sha256sum "$MOUNT_UNIT" 2>/dev/null || true)"
+
+msg="Updated $current -> $latest."
+if [ "$before" != "$after" ] && systemctl is-active --quiet plex-cache-mount; then
+  # Restarting the mount would interrupt playback, so leave that to the user.
+  msg="$msg Mount changes apply the next time the mount restarts."
+fi
+note "$msg"
+systemctl restart plex-precache
