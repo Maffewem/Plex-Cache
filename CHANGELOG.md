@@ -3,6 +3,11 @@
 The version is shown on the status page (`/plexcache/`) and by
 `python3 /opt/plex-precache/plex_precache.py --version`.
 
+## 1.3.1 (10 Oct 2026)
+
+- Fixed: an episode whose start had already been pre-cached as "next episode" wasn't downloaded in full when you played it.
+- Fixed: music wasn't picked up at all.
+
 ## 1.3.0 (10 Oct 2026)
 
 - Each change now bumps the version number.

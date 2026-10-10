@@ -36,7 +36,7 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 
-__version__ = "1.3.0"
+__version__ = "1.3.1"
 __released__ = "2026-10-10"
 
 log = logging.getLogger("plex-precache")
@@ -142,7 +142,8 @@ def first_part(video: ET.Element) -> ET.Element | None:
 def parse_sessions(root: ET.Element) -> list[dict]:
     """Active sessions with the file being played and how far in it is."""
     out = []
-    for video in root.findall("./Video"):
+    # Films and TV are <Video>; music is <Track>.
+    for video in root.findall("./Video") + root.findall("./Track"):
         part = first_part(video)
         if part is None or not part.get("file"):
             continue
@@ -312,7 +313,8 @@ class Prefetcher:
         self.queue: list[tuple[int, int, Job]] = []
         self.counter = itertools.count()
         self.active: dict[str, Job] = {}  # queued or running, by local path
-        self.done: dict[str, float] = {}  # path -> time finished
+        self.done: dict[str, float] = {}  # path -> time the whole file finished
+        self.heads: dict[str, float] = {}  # path -> time just its start finished
         # For the status page.
         self.recent: collections.deque = collections.deque(maxlen=25)
         self.sessions: list[dict] = []
@@ -328,9 +330,11 @@ class Prefetcher:
         with self.cv:
             job = self.active.get(path)
             if job is not None:
-                job.jump_to(start)
+                self._promote(job, start, end, prio, owner)
                 return
-            finished = self.done.get(path)
+            # Caching only the start (next episode, On Deck) doesn't count
+            # as done once the file is actually played.
+            finished = self.done.get(path) or (self.heads.get(path) if end else None)
             if finished and time.time() - finished < self.cfg.remember:
                 return
         if self.cfg.require_cache_mount and self.uncached_mount(path):
@@ -348,12 +352,31 @@ class Prefetcher:
         job = Job(path, start, end, prio, owner)
         with self.cv:
             if path in self.active:
-                self.active[path].jump_to(start)
+                self._promote(self.active[path], start, end, prio, owner)
                 return
             self.active[path] = job
             heapq.heappush(self.queue, (prio, next(self.counter), job))
             self.cv.notify()
         log.info("queued %s from %d MB (prio %d)", path, start // MB, prio)
+
+    def _promote(self, job: Job, start: int, end: int | None, prio: int,
+                 owner: str | None) -> None:
+        """Merge a new request into a job already queued or running for the file.
+
+        Call with self.cv held. A next-episode job that only reads the start
+        becomes a full read once that episode is actually playing.
+        """
+        job.jump_to(start)
+        with job.lock:
+            if job.end is not None and (end is None or end > job.end):
+                job.end = end
+            if owner:
+                job.owner = owner
+        if prio < job.prio:
+            job.prio = prio
+            if job.started_at is None:  # still waiting: move it up the queue
+                heapq.heappush(self.queue, (prio, next(self.counter), job))
+                self.cv.notify()
 
     def uncached_mount(self, path: str) -> str | None:
         """The mountpoint if `path` is on a filesystem that can't cache to disk.
@@ -412,8 +435,8 @@ class Prefetcher:
                 if self.stop.is_set():
                     return
                 _, _, job = heapq.heappop(self.queue)
-            if job.cancelled:
-                continue
+            if job.cancelled or job.started_at is not None:
+                continue  # cancelled, or a duplicate entry left by _promote
             started = job.started_at = time.time()
             ok = False
             try:
@@ -434,7 +457,7 @@ class Prefetcher:
                         del self.active[job.path]
                     # Failed reads are retried on the next poll.
                     if ok and not self.stop.is_set():
-                        self.done[job.path] = time.time()
+                        (self.heads if job.end else self.done)[job.path] = time.time()
 
     def saw_playing(self, paths: list[str]) -> None:
         now = time.time()
@@ -481,8 +504,9 @@ class Prefetcher:
     def forget_expired(self) -> None:
         cutoff = time.time() - self.cfg.remember
         with self.cv:
-            for path in [p for p, t in self.done.items() if t < cutoff]:
-                del self.done[path]
+            for seen in (self.done, self.heads):
+                for path in [p for p, t in seen.items() if t < cutoff]:
+                    del seen[path]
 
     def snapshot(self) -> dict:
         """State for the status page."""
