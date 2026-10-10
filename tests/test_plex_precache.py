@@ -16,11 +16,13 @@ pp.DEFAULTS["require_cache_mount"] = "false"
 SESSIONS = """<MediaContainer size="2">
   <Video ratingKey="102" type="episode" grandparentRatingKey="100" grandparentTitle="Show"
          title="Ep 2" viewOffset="600000" duration="2400000">
-    <Media><Part file="/data/tv/Show/S01E02.mkv" size="4000000000"/></Media>
+    <Media bitrate="13333"><Part file="/data/tv/Show/S01E02.mkv" size="4000000000"/></Media>
     <Player state="playing"/>
+    <Session id="abc" bandwidth="14000" location="lan"/>
   </Video>
   <Video ratingKey="7" type="movie" title="Film" viewOffset="0" duration="6000000">
     <Media><Part file="/data/movies/Film.mkv" size="20000000000"/></Media>
+    <TranscodeSession speed="1.5" videoDecision="transcode" throttled="0"/>
   </Video>
 </MediaContainer>"""
 
@@ -42,6 +44,17 @@ class ParseTests(unittest.TestCase):
         self.assertEqual(s[0]["state"], "playing")
         self.assertEqual(s[1]["type"], "movie")
         self.assertIsNone(s[1]["state"])
+
+    def test_plex_delivery_rate(self):
+        direct, trans = pp.parse_sessions(ET.fromstring(SESSIONS))
+        self.assertEqual((direct["decision"], direct["send_kbps"]), ("direct play", 14000))
+        self.assertEqual(pp.plex_rate_text(direct, 1_666_000),
+                         "Plex: direct play, reading about 14 Mbps from the file, "
+                         "sending 14 Mbps to the player.")
+        self.assertEqual((trans["decision"], trans["transcode_speed"]), ("transcode", 1.5))
+        # A 1.5x transcode of a 2 MB/s (16 Mbps) file reads 24 Mbps.
+        self.assertEqual(pp.plex_rate_text(trans, 2_000_000),
+                         "Plex: transcode at 1.5x, reading about 24 Mbps from the file.")
 
     def test_next_episodes(self):
         files = pp.next_episode_files(ET.fromstring(LEAVES), "102", 2)

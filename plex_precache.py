@@ -155,8 +155,52 @@ def parse_sessions(root: ET.Element) -> list[dict]:
             "duration": int(video.get("duration") or part.get("duration") or 0),
             "state": (video.find("./Player").get("state")
                       if video.find("./Player") is not None else None),
+            **_delivery(video),
         })
     return out
+
+
+def _num(value: str | None) -> float:
+    try:
+        return float(value or 0)
+    except ValueError:
+        return 0.0
+
+
+def _delivery(video: ET.Element) -> dict:
+    """How Plex is serving a session: direct play or transcode, and how fast."""
+    session, ts = video.find("./Session"), video.find("./TranscodeSession")
+    media = video.find("./Media")
+    decision = "direct play"
+    if ts is not None:
+        decision = ("transcode" if ts.get("videoDecision") == "transcode"
+                    else "direct stream")
+    return {
+        "decision": decision,
+        # kbps as Plex reports them; 0 when it doesn't say.
+        "send_kbps": _num(session.get("bandwidth") if session is not None else None),
+        "media_kbps": _num(media.get("bitrate") if media is not None else None),
+        "transcode_speed": _num(ts.get("speed") if ts is not None else None),
+        "throttled": ts is not None and ts.get("throttled") == "1",
+    }
+
+
+def plex_rate_text(s: dict, bitrate: float) -> str:
+    """'Plex: transcoding at 1.4x, reading about 34 Mbps' for the stream card."""
+    parts = [s.get("decision") or ""]
+    read = 0.0
+    if s.get("decision") == "transcode" and s.get("transcode_speed"):
+        parts[0] += (f" at {s['transcode_speed']:.1f}x"
+                     + (" (paused until the player needs more)" if s.get("throttled") else ""))
+        read = bitrate * s["transcode_speed"]
+    elif s.get("send_kbps"):
+        read = s["send_kbps"] * 1000 / 8
+    if read:
+        parts.append(f"reading about {_mbps(read)} from the file")
+    if s.get("send_kbps"):
+        parts.append(f"sending {_mbps(s['send_kbps'] * 1000 / 8)} to the player")
+    text = ", ".join(p for p in parts if p)
+    return f"Plex: {text}." if text else ""
 
 
 def next_episode_files(all_leaves: ET.Element, rating_key: str, count: int) -> list[str]:
@@ -679,7 +723,8 @@ def stream_health(s: dict, d: dict, now: float | None = None) -> dict:
         playhead = min(size, playhead + int(bitrate * (now - s.get("seen_at", now))))
     job = next((j for j in d["jobs"] if j["path"] == path), None)
     out = {"title": s.get("title") or os.path.basename(path), "state": s.get("state"),
-           "bitrate": bitrate, "file": os.path.basename(path), "ahead_s": None}
+           "bitrate": bitrate, "file": os.path.basename(path), "ahead_s": None,
+           "plex": plex_rate_text(s, bitrate)}
 
     if job is None and path in d.get("done", {}):
         level, msg = GOOD, "Fully cached: playing from local disk."
@@ -851,7 +896,8 @@ def render_status(d: dict, settings: str = "") -> str:
         f"{badge(s['level'])}</div><div class=muted>{e(s['file'])} · "
         f"{e(s['state'] or 'unknown')}"
         f"{' · ' + _mbps(s['bitrate']) + ' video' if s['bitrate'] else ''}</div>"
-        f"{bar(s['ahead_s'])}<p>{e(s['detail'])}</p></div>"
+        f"{bar(s['ahead_s'])}<p>{e(s['detail'])}</p>"
+        f"{'<p class=muted>' + e(s['plex']) + '</p>' if s.get('plex') else ''}</div>"
         for s in d["streams"]) or "<p class=muted>Nothing playing in Plex.</p>"
     checks = "".join(
         f"<tr><td class=k>{e(x['title'])}</td><td>{badge(x['level'])}</td><td>{e(x['detail'])}</td></tr>"
