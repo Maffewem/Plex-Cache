@@ -1,8 +1,10 @@
 import os
+import subprocess
 import sys
 import tempfile
 import threading
 import unittest
+from unittest import mock
 import xml.etree.ElementTree as ET
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -388,6 +390,180 @@ class RecommendTests(unittest.TestCase):
             self.assertIn("action=update/run", page)
             self.assertIn("Automatic updates on", pp.set_auto_update(cfg, {"auto_update": "on"}))
             self.assertTrue(pp.Config(ini).auto_update)
+
+
+class RcloneSettingsTests(unittest.TestCase):
+    """The connection and advanced rclone settings on the status page."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        d = self.tmp.name
+        self.mnt = os.path.join(d, "data")
+        os.mkdir(self.mnt)
+        self.key = os.path.join(d, "ssh_key")
+        with open(self.key, "w") as f:
+            f.write("old key\n")
+        self.conf = os.path.join(d, "rclone.conf")
+        with open(self.conf, "w") as f:
+            f.write(f"[plexcache-sftp]\ntype = sftp\nhost = old.example\nuser = me\n"
+                    f"port = 22\nkey_file = {self.key}\nshell_type = unix\n")
+        self.env = os.path.join(d, "env")
+        with open(self.env, "w") as f:
+            f.write(f"REMOTE=plexcache-sftp:/home/me/data\nMOUNTPOINT={self.mnt}\n"
+                    f"RCLONE_CONFIG={self.conf}\nEXTRA_ARGS=\"--vfs-read-chunk-streams 4\"\n")
+        self.ini = os.path.join(d, "config.ini")
+        with open(self.ini, "w") as f:
+            f.write("[plex]\nworkers = 2\n")
+        self.cfg = pp.Config(self.ini)
+        self.cfg.mount_env, self.cfg.cache_dir = self.env, d
+        # A stand-in rclone that records its config and fails for host "bad.example".
+        bindir = os.path.join(d, "bin")
+        os.mkdir(bindir)
+        self.seen = os.path.join(d, "seen.conf")
+        with open(os.path.join(bindir, "rclone"), "w") as f:
+            f.write(f"#!/bin/sh\nconf=$2\ncp \"$conf\" {self.seen}\n"
+                    "grep -q 'bad.example' \"$conf\" && { echo '2026/10/10 10:00:00 ERROR : "
+                    "dial tcp: lookup bad.example: no such host' >&2; exit 1; }\n"
+                    "printf 'Movies/\\nTV/\\n'\n")
+        os.chmod(os.path.join(bindir, "rclone"), 0o755)
+        self.old_path = os.environ["PATH"]
+        os.environ["PATH"] = bindir + os.pathsep + self.old_path
+        self.restarts = []
+        self.real_restart = pp.restart_mount_or_revert
+        pp.restart_mount_or_revert = lambda backups: self.restarts.append(backups) or "ok"
+
+    def tearDown(self):
+        os.environ["PATH"] = self.old_path
+        pp.restart_mount_or_revert = self.real_restart
+        self.tmp.cleanup()
+
+    def form(self, **kw):
+        return {"host": "new.example", "user": "me", "port": "2222", "path": "/srv/media",
+                "mountpoint": self.mnt, "key": "", "do": "save", **kw}
+
+    def test_page_shows_connection_and_advanced_fields(self):
+        page = pp.render_settings(self.cfg, "tok", None, True)
+        self.assertIn("action=settings/connection", page)
+        self.assertIn("value='old.example'", page)
+        self.assertIn("value='--vfs-read-chunk-streams 4'", page)
+
+    def test_test_only_changes_nothing(self):
+        before = open(self.conf).read(), open(self.env).read()
+        msg = pp.apply_connection(self.cfg, self.form(do="test"))
+        self.assertIn("2 item(s) in /srv/media", msg)
+        self.assertIn("host = new.example", open(self.seen).read())
+        self.assertEqual((open(self.conf).read(), open(self.env).read()), before)
+        self.assertEqual(self.restarts, [])
+
+    def test_failed_test_refuses_to_save(self):
+        before = open(self.conf).read()
+        with self.assertRaisesRegex(pp.SettingsError, "no such host.*Nothing was changed"):
+            pp.apply_connection(self.cfg, self.form(host="bad.example"))
+        self.assertEqual(open(self.conf).read(), before)
+
+    def test_save_writes_conf_env_and_key_then_restarts(self):
+        key = "-----BEGIN OPENSSH PRIVATE KEY-----\r\nabc\r\n-----END OPENSSH PRIVATE KEY-----"
+        with mock.patch.object(pp, "CONF_DIR", self.tmp.name):
+            msg = pp.apply_connection(self.cfg, self.form(key=key))
+        self.assertIn("Saved and the mount restarted", msg)
+        conf = open(self.conf).read()
+        self.assertIn("host = new.example", conf)
+        self.assertIn("port = 2222", conf)
+        self.assertIn(f"key_file = {self.key}", conf)
+        self.assertIn("REMOTE=plexcache-sftp:/srv/media", open(self.env).read())
+        self.assertEqual(open(self.key).read(), key.replace("\r\n", "\n") + "\n")
+        # The restart got the old files to put back if the mount won't start.
+        self.assertEqual(self.restarts[0][self.key], "old key\n")
+        self.assertIn("old.example", self.restarts[0][self.conf])
+
+    def test_rejects_unsafe_values(self):
+        for bad in ({"host": "a.example; rm -rf /"}, {"user": "me me"}, {"port": "0"},
+                    {"path": "relative"}, {"path": "/x/$(id)"}, {"path": "/x\nEVIL=1"},
+                    {"mountpoint": "/does/not/exist"}, {"key": "not a key"}):
+            with self.assertRaises(pp.SettingsError, msg=str(bad)):
+                pp.validate_connection(self.form(**bad), pp.sftp_settings(self.cfg))
+        with open(os.path.join(self.mnt, "file"), "w"):
+            pass
+        other = os.path.join(self.tmp.name, "other")
+        os.mkdir(other)
+        pp.validate_connection(self.form(mountpoint=other), pp.sftp_settings(self.cfg))
+        with self.assertRaisesRegex(pp.SettingsError, "isn't empty"):
+            pp.check_mountpoint(self.mnt, other)
+
+    def test_unmanaged_remote_is_read_only(self):
+        pp.update_env(self.env, {"REMOTE": "gdrive:media"})
+        self.assertIsNone(pp.sftp_settings(self.cfg))
+        self.assertIn("set up outside Plex-Cache", pp.render_settings(self.cfg, "t", None, True))
+        with self.assertRaises(pp.SettingsError):
+            pp.apply_connection(self.cfg, self.form())
+
+    def test_extra_flags(self):
+        self.assertEqual(pp.validate_flags("  --bwlimit 80M   --vfs-read-chunk-streams=4 "),
+                         "--bwlimit 80M --vfs-read-chunk-streams=4")
+        self.assertEqual(pp.validate_flags(""), "")
+        for bad in ("--rc", "--rc-addr :5572", "--config /tmp/x", "--bwlimit $(id)",
+                    "80M --bwlimit", "--x;reboot", "--x\nEVIL=1"):
+            with self.assertRaises(pp.SettingsError, msg=bad):
+                pp.validate_flags(bad)
+
+    def test_env_values_with_spaces_are_quoted_for_bash(self):
+        pp.update_env(self.env, {"EXTRA_ARGS": "--bwlimit 80M", "DIR_CACHE_TIME": "1h"})
+        text = open(self.env).read()
+        self.assertIn('EXTRA_ARGS="--bwlimit 80M"', text)
+        self.assertEqual(pp.read_env_file(self.env)["EXTRA_ARGS"], "--bwlimit 80M")
+        out = subprocess.run(["bash", "-ec", f'. "{self.env}"; echo "$EXTRA_ARGS"'],
+                             capture_output=True, text=True)
+        self.assertEqual(out.stdout.strip(), "--bwlimit 80M")
+
+    def test_mount_form_keeps_advanced_values_and_defaults_blanks(self):
+        mount = {"CACHE_MAX_SIZE": "20G", "CACHE_PERCENT": "", "CACHE_MIN_FREE": "10G",
+                 "CACHE_MAX_AGE": "72h", "READ_AHEAD": "1G", "BUFFER_SIZE": "128M"}
+        out = pp.validate_mount(mount)
+        self.assertEqual((out["VFS_CHUNK_SIZE"], out["DIR_CACHE_TIME"], out["EXTRA_ARGS"]),
+                         ("64M", "1h", ""))
+
+
+    def test_media_mount_offers_the_right_switch(self):
+        env = {"MOUNTPOINT": self.mnt}
+        pp.update_env(self.env, env)
+        sshfs = f"u@h:/data {self.mnt} fuse.sshfs rw 0 0\n"
+        rclone = f"plexcache-sftp: {self.mnt} fuse.rclone rw 0 0\n"
+        self.assertEqual(pp.media_mount(self.cfg, sshfs)["fstype"], "fuse.sshfs")
+        self.assertTrue(pp.media_mount(self.cfg, rclone)["undo"])
+        # The settings point elsewhere, but there's exactly one SSHFS mount.
+        other = "u@h:/data /media/x fuse.sshfs rw 0 0\n"
+        self.assertEqual(pp.media_mount(self.cfg, other)["where"], "/media/x")
+        with mock.patch.object(pp, "media_mount", lambda cfg: {
+                "where": self.mnt, "fstype": "fuse.sshfs", "undo": False,
+                "note": "2026-10-10 11:00 Test passed"}):
+            page = pp.render_settings(self.cfg, "t", None, True)
+        self.assertIn("action=switch/run", page)
+        self.assertIn("Last switch: 2026-10-10 11:00 Test passed", page)
+        with mock.patch.object(pp, "media_mount", lambda cfg: {
+                "where": self.mnt, "fstype": "fuse.rclone", "undo": True, "note": ""}):
+            self.assertIn("action=switch/back", pp.render_settings(self.cfg, "t", None, True))
+
+    def test_failed_restart_puts_old_files_back(self):
+        with open(self.env) as f:
+            old = f.read()
+        pp.update_env(self.env, {"EXTRA_ARGS": "--nonsense"})
+        calls = []
+
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+            rc = 1 if len(calls) == 1 else 0
+            return subprocess.CompletedProcess(cmd, rc, "", "Job failed. See journalctl")
+        with mock.patch.object(pp.subprocess, "run", fake_run):
+            self.assertEqual(self.real_restart({self.env: old}), "reverted")
+        self.assertEqual(open(self.env).read(), old)
+        self.assertEqual(len(calls), 2)
+
+        def no_sudo(cmd, **kw):
+            return subprocess.CompletedProcess(cmd, 1, "", "sudo: a password is required")
+        pp.update_env(self.env, {"EXTRA_ARGS": "--nonsense"})
+        with mock.patch.object(pp.subprocess, "run", no_sudo):
+            self.assertEqual(self.real_restart({self.env: old}), "no-restart")
+        self.assertIn("--nonsense", open(self.env).read())
 
 
 if __name__ == "__main__":

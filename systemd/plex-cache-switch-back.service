@@ -1,0 +1,6 @@
+[Unit]
+Description=Move the media mount from the Plex-Cache cached mount back to SSHFS
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/plex-cache-switch --back

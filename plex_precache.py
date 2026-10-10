@@ -17,6 +17,7 @@ import configparser
 import heapq
 import html
 import http.server
+import io
 import itertools
 import json
 import logging
@@ -28,13 +29,14 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 __released__ = "2026-10-10"
 
 log = logging.getLogger("plex-precache")
@@ -914,6 +916,8 @@ td.k+td{{width:1%}}progress{{width:90px}}html,body{{overflow-x:hidden}}{SETTINGS
 <button id=toggle class='live on' type=button aria-pressed=false
 title="Pause or resume live updates"><span class=dot></span><b id=livetext>Live</b>
 <span class=sub id=updated></span></button></div>
+{'<nav class=tabs><a href="#status" data-tab=status>Status</a><a href="#settings" data-tab=settings>Settings</a></nav>' if settings else ''}
+<div id=status-tab>
 <div id=main>
 <div class='verdict {overall}'>{e(verdict)}</div>
 <div class=stats><div><b>{_gb(c['used'])}</b><span class=muted>cached
@@ -929,7 +933,6 @@ title="Pause or resume live updates"><span class=dot></span><b id=livetext>Live<
 <th>At</th></tr>{recent}</table></div>
 <p class=muted>{limits or 'Mount settings not readable'}</p>
 </div>
-{settings}
 <details><summary>What's normal?</summary>
 <p><b>Good</b>: the cache is at least {AHEAD_GOOD_S // 60} minutes ahead of playback and
 the link downloads at least {SPEED_GOOD_RATIO}x faster than the video plays, or the file is
@@ -941,6 +944,8 @@ there's little slack.</p>
 slower than the video's bitrate, or the disk is below its free-space floor. Fixes: pre-warm
 with --warm before watching, lower the quality in Plex, or give the cache more disk.</p>
 </details>
+</div>
+{settings}
 <script>
 (function () {{
   var paused = false, last = Date.now(), failed = false;
@@ -972,6 +977,72 @@ with --warm before watching, lower the quality in Plex, or give the cache more d
       last = Date.now(); failed = false; label();
     }}).catch(function () {{ failed = true; label(); }});
   }}
+  // Status and Settings tabs, and settings panels that fold away. Without
+  // JavaScript everything shows on one page.
+  var tabs = document.querySelectorAll(".tabs a"), statusTab = document.getElementById("status-tab"),
+      settingsTab = document.getElementById("settings");
+  function showTab(name) {{
+    if (!settingsTab) return;
+    statusTab.hidden = name !== "status"; settingsTab.hidden = name !== "settings";
+    tabs.forEach(function (a) {{ a.classList.toggle("on", a.dataset.tab === name); }});
+    try {{ localStorage.setItem("plexcache-tab", name); }} catch (e) {{}}
+  }}
+  tabs.forEach(function (a) {{
+    a.addEventListener("click", function (ev) {{
+      ev.preventDefault(); showTab(a.dataset.tab); window.scrollTo(0, 0);
+    }});
+  }});
+  var hash = location.hash.slice(1), tab = "status";
+  try {{ tab = localStorage.getItem("plexcache-tab") || "status"; }} catch (e) {{}}
+  if (hash === "settings" || hash.indexOf("s-") === 0) tab = "settings";
+  if (hash === "status") tab = "status";
+  showTab(tab);
+  var heading = settingsTab && settingsTab.querySelector("h2");
+  if (heading && tabs.length) heading.hidden = true;  // the tab already says it
+  var open = {{}};
+  try {{ open = JSON.parse(localStorage.getItem("plexcache-open") || "{{}}"); }} catch (e) {{}}
+  document.querySelectorAll("#settings .panel[id]").forEach(function (panel) {{
+    var h = panel.querySelector("h3");
+    if (!h) return;
+    // Folded unless opened before, just saved, or asking for action (the SSHFS switch).
+    var isOpen = open[panel.id] !== undefined ? open[panel.id]
+                 : panel.classList.contains("badbox");
+    if (hash === panel.id) isOpen = true;
+    h.setAttribute("role", "button"); h.tabIndex = 0;
+    function set(v) {{
+      panel.classList.toggle("collapsed", !v); h.setAttribute("aria-expanded", v ? "true" : "false");
+    }}
+    function flip() {{
+      var v = panel.classList.contains("collapsed"); set(v); open[panel.id] = v;
+      try {{ localStorage.setItem("plexcache-open", JSON.stringify(open)); }} catch (e) {{}}
+    }}
+    h.addEventListener("click", flip);
+    h.addEventListener("keydown", function (ev) {{
+      if (ev.key === "Enter" || ev.key === " ") {{ ev.preventDefault(); flip(); }}
+    }});
+    set(isOpen);
+  }});
+
+  // Saving a setting reloads the page; come back to the same spot.
+  document.querySelectorAll("#settings form").forEach(function (f) {{
+    f.addEventListener("submit", function () {{
+      try {{ sessionStorage.setItem("plexcache-scroll", String(window.scrollY)); }} catch (e) {{}}
+    }});
+  }});
+  if (/[?&]saved=1/.test(location.search)) {{
+    var y = null;
+    try {{ y = sessionStorage.getItem("plexcache-scroll");
+           sessionStorage.removeItem("plexcache-scroll"); }} catch (e) {{}}
+    history.replaceState(null, "", location.pathname);
+    if (y !== null) {{
+      var back = function () {{ window.scrollTo(0, +y); }};
+      back(); window.addEventListener("load", back);  // after any jump to the #panel anchor
+    }}
+  }}
+  var toast = document.getElementById("toast");
+  if (toast && toast.classList.contains("good")) setTimeout(function () {{
+    toast.style.opacity = "0"; setTimeout(function () {{ toast.remove(); }}, 500);
+  }}, 6000);
   setInterval(refresh, 5000); setInterval(label, 1000); label();
 }})();
 </script></body></html>"""
@@ -1011,6 +1082,26 @@ MOUNT_FIELDS = [
     ("READ_AHEAD", "Read ahead per stream", "size", "How far rclone downloads ahead of Plex."),
     ("BUFFER_SIZE", "RAM buffer per stream", "size", "Memory per open file, e.g. 128M."),
 ]
+# More rclone mount settings, shown under "Advanced" in the same form.
+RCLONE_FIELDS = [
+    ("VFS_CHUNK_SIZE", "Chunk size", "size",
+     "Size of each ranged request to the server; it doubles up to 2G on long reads. "
+     "Larger suits fast, high-latency links."),
+    ("DIR_CACHE_TIME", "Keep folder listings for", "duration",
+     "How long rclone trusts its folder listings before asking the server again. "
+     "New files on the server can take this long to appear."),
+    ("EXTRA_ARGS", "Extra rclone flags", "flags",
+     "Any other rclone mount flags, e.g. --vfs-read-chunk-streams 4 (rclone 1.68+, "
+     "parallel downloads per file) or --bwlimit 80M. If the mount won't start with "
+     "them, the previous flags are put back."),
+]
+# What a blank advanced field means (and what the mount unit used before they existed).
+RCLONE_DEFAULTS = {"VFS_CHUNK_SIZE": "64M", "DIR_CACHE_TIME": "1h"}
+# Flags that would point rclone somewhere else or expose it; set elsewhere or not at all.
+BLOCKED_FLAGS = ("--config", "--cache-dir", "--rc", "--daemon", "--allow-root",
+                 "--log-file", "--password-command", "--user-agent", "--ask-password")
+FLAG_TOKEN_RE = re.compile(r"^(--?[A-Za-z0-9][A-Za-z0-9-]*(=[A-Za-z0-9._:/,+@%-]*)?"
+                           r"|[A-Za-z0-9._:/,+@%-]+)$")
 SIZE_RE = re.compile(r"^\d+(\.\d+)?[KMGT]$")
 DURATION_RE = re.compile(r"^\d+[smhdwMy]$")
 
@@ -1101,10 +1192,27 @@ def validate_prefetch(form: dict) -> dict:
     return out
 
 
+def validate_flags(raw: str) -> str:
+    tokens = raw.split()
+    for t in tokens:
+        if not FLAG_TOKEN_RE.match(t):
+            raise SettingsError(f"Extra rclone flags: can't use {t!r}. Use plain flags "
+                                "like --bwlimit 80M.")
+        if t.startswith("-") and t.split("=", 1)[0].startswith(BLOCKED_FLAGS):
+            raise SettingsError(f"Extra rclone flags: {t.split('=', 1)[0]} can't be set here.")
+    if tokens and not tokens[0].startswith("-"):
+        raise SettingsError("Extra rclone flags must start with a flag such as --bwlimit.")
+    return " ".join(tokens)
+
+
 def validate_mount(form: dict) -> dict:
     out = {}
-    for key, label, kind, _help in MOUNT_FIELDS:
-        raw = (form.get(key) or "").strip().upper() if kind == "size" else (form.get(key) or "").strip()
+    for key, label, kind, _help in MOUNT_FIELDS + RCLONE_FIELDS:
+        if kind == "flags":
+            out[key] = validate_flags(form.get(key) or "")
+            continue
+        raw = (form.get(key) or "").strip() or RCLONE_DEFAULTS.get(key, "")
+        raw = raw.upper() if kind == "size" else raw
         if kind == "percent":
             if raw and (not raw.isdigit() or not 1 <= int(raw) <= 100):
                 raise SettingsError(f"{label} must be from 1 to 100, or blank.")
@@ -1151,6 +1259,12 @@ def update_ini(path: str, values: dict) -> None:
     _write_in_place(path, "\n".join(lines) + "\n")
 
 
+def env_quote(value: str) -> str:
+    # The file is read by systemd and sourced by bash; unquoted spaces would
+    # make bash run the rest as a command. Values never contain " $ ` or \.
+    return f'"{value}"' if re.search(r"\s", value) else value
+
+
 def update_env(path: str, values: dict) -> None:
     """Set KEY=value lines in an env file; a blank value removes the key."""
     with open(path) as f:
@@ -1162,9 +1276,9 @@ def update_env(path: str, values: dict) -> None:
             seen.add(m.group(1))
             if values[m.group(1)] == "":
                 continue
-            line = f"{m.group(1)}={values[m.group(1)]}"
+            line = f"{m.group(1)}={env_quote(values[m.group(1)])}"
         out.append(line)
-    out += [f"{k}={v}" for k, v in values.items() if k not in seen and v != ""]
+    out += [f"{k}={env_quote(v)}" for k, v in values.items() if k not in seen and v != ""]
     _write_in_place(path, "\n".join(out) + "\n")
 
 
@@ -1191,6 +1305,200 @@ def systemctl_restart(unit: str) -> bool:
         return False
 
 
+def restart_mount_or_revert(backups: dict) -> str:
+    """Restart the mount; if it won't come up, restore the files and restart again.
+
+    backups maps each changed file to its previous contents. Returns "ok",
+    "reverted" or "no-restart" (no sudo rule).
+    """
+    try:
+        res = subprocess.run(["sudo", "-n", "systemctl", "restart", "plex-cache-mount"],
+                             capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.TimeoutExpired):
+        return "no-restart"
+    if res.returncode == 0:
+        return "ok"
+    if res.stderr.lstrip().startswith("sudo"):
+        return "no-restart"
+    log.warning("plex-cache-mount failed to start with the new settings; putting back the old ones")
+    for path, text in backups.items():
+        _write_in_place(path, text)
+    systemctl_restart("plex-cache-mount")
+    return "reverted"
+
+
+SFTP_SECTION = "plexcache-sftp"  # the remote install.sh --sftp writes
+CONF_DIR = "/etc/plex-precache"
+HOST_RE = re.compile(r"^([A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?|[0-9A-Fa-f:]*:[0-9A-Fa-f:.]*)$")
+USER_RE = re.compile(r"^[A-Za-z0-9._][A-Za-z0-9._-]{0,63}$")
+# Safe both in rclone and when root scripts source the env file.
+REMOTE_PATH_RE = re.compile(r"^/[A-Za-z0-9 ._/@%+,:~-]*$")
+
+
+def sftp_settings(cfg: Config) -> dict | None:
+    """The SFTP connection, when it's the one install.sh --sftp set up."""
+    env = read_env_file(cfg.mount_env) if cfg.mount_env else {}
+    remote, conf = env.get("REMOTE", ""), env.get("RCLONE_CONFIG", "")
+    if not remote.startswith(SFTP_SECTION + ":") or not conf:
+        return None
+    cp = configparser.RawConfigParser()
+    try:
+        cp.read(conf)
+    except configparser.Error:
+        return None
+    if not cp.has_section(SFTP_SECTION):
+        return None
+    sec = cp[SFTP_SECTION]
+    return {"host": sec.get("host", ""), "user": sec.get("user", ""),
+            "port": sec.get("port", "22"), "path": remote.split(":", 1)[1],
+            "mountpoint": env.get("MOUNTPOINT", ""), "conf": conf,
+            "key_file": sec.get("key_file", ""), "parser": cp}
+
+
+def check_mountpoint(new: str, current: str) -> None:
+    if new == current:
+        return
+    if not new.startswith("/") or not REMOTE_PATH_RE.match(new) or new.rstrip("/") == "":
+        raise SettingsError("Mount at must be a full folder path such as /data.")
+    if not os.path.isdir(new):
+        raise SettingsError(f"{new} doesn't exist. Create it first: sudo mkdir {new} && "
+                            f"sudo chown $(whoami): {new}")
+    if os.path.ismount(new) or os.listdir(new):
+        raise SettingsError(f"{new} isn't empty or already has something mounted on it.")
+    if not os.access(new, os.W_OK):
+        raise SettingsError(f"Plex-Cache can't mount on {new}; give its user ownership: "
+                            f"sudo chown <user>: {new}")
+
+
+def validate_connection(form: dict, cur: dict) -> dict:
+    v = {k: (form.get(k) or "").strip() for k in ("host", "user", "port", "path", "mountpoint")}
+    if not HOST_RE.match(v["host"]):
+        raise SettingsError("Server must be a hostname or IP address.")
+    if not USER_RE.match(v["user"]):
+        raise SettingsError("User must be a plain user name.")
+    if not v["port"].isdigit() or not 1 <= int(v["port"]) <= 65535:
+        raise SettingsError("Port must be a number from 1 to 65535.")
+    if not REMOTE_PATH_RE.match(v["path"]):
+        raise SettingsError("Folder on the server must be a full path such as /home/me/data.")
+    v["mountpoint"] = v["mountpoint"].rstrip("/") or "/"
+    check_mountpoint(v["mountpoint"], cur["mountpoint"])
+    key = (form.get("key") or "").replace("\r\n", "\n").strip()
+    if key and not (key.startswith("-----BEGIN") and "PRIVATE KEY-----" in key):
+        raise SettingsError("The SSH key must be a private key, starting with -----BEGIN.")
+    v["key"] = key + "\n" if key else ""
+    return v
+
+
+def known_hosts_has(path: str, host: str, port: str) -> bool:
+    try:
+        with open(path) as f:
+            text = f.read()
+    except OSError:
+        return False
+    if re.search(rf"(^|,|\[){re.escape(host)}[\],\s]", text, re.M):
+        return True
+    name = host if port == "22" else f"[{host}]:{port}"
+    try:  # hashed entries
+        return subprocess.run(["ssh-keygen", "-F", name, "-f", path], stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL, timeout=10).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def connection_conf(cur: dict, v: dict, key_file: str) -> tuple[str, bool]:
+    """rclone.conf text for the new settings, and whether the host key is checked."""
+    cp = configparser.RawConfigParser()
+    cp.read_dict({s: dict(cur["parser"][s]) for s in cur["parser"].sections()})
+    sec = cp[SFTP_SECTION]
+    sec["host"], sec["user"], sec["port"], sec["key_file"] = v["host"], v["user"], v["port"], key_file
+    kh = sec.get("known_hosts_file") or os.path.join(CONF_DIR, "known_hosts")
+    verified = known_hosts_has(kh, v["host"], v["port"])
+    if verified:
+        sec["known_hosts_file"] = kh
+    else:
+        sec.pop("known_hosts_file", None)
+    out = io.StringIO()
+    cp.write(out)
+    return out.getvalue(), verified
+
+
+def rclone_bin() -> str:
+    return shutil.which("rclone") or "/usr/bin/rclone"
+
+
+def test_connection(cur: dict, v: dict) -> tuple[bool, str, bool]:
+    """List the remote folder with the new settings without touching the live ones."""
+    remote = f"{SFTP_SECTION}:{v['path']}"
+    with tempfile.TemporaryDirectory(prefix="plexcache-test-") as tmp:
+        key_file = cur["key_file"]
+        if v["key"]:
+            key_file = os.path.join(tmp, "key")
+            with open(os.open(key_file, os.O_WRONLY | os.O_CREAT, 0o600), "w") as f:
+                f.write(v["key"])
+        text, verified = connection_conf(cur, v, key_file)
+        conf = os.path.join(tmp, "rclone.conf")
+        with open(os.open(conf, os.O_WRONLY | os.O_CREAT, 0o600), "w") as f:
+            f.write(text)
+        try:
+            res = subprocess.run([rclone_bin(), "--config", conf, "lsf", "--max-depth", "1",
+                                  "--contimeout", "15s", "--timeout", "30s", "--retries", "1",
+                                  "--low-level-retries", "1", remote],
+                                 capture_output=True, text=True, timeout=90)
+        except (OSError, subprocess.TimeoutExpired) as err:
+            return False, f"Couldn't connect to {v['host']}: {err}.", verified
+    if res.returncode != 0:
+        lines = [l for l in res.stderr.splitlines() if l.strip()]
+        why = re.sub(r"^\S+ \S+ (ERROR|NOTICE|Failed)\s*:\s*", "", lines[-1] if lines else "")
+        return False, f"Couldn't connect to {v['host']}: {why[:300] or 'rclone failed'}.", verified
+    n = len([l for l in res.stdout.splitlines() if l.strip()])
+    return True, f"Connected to {v['host']}: {n} item(s) in {v['path']}.", verified
+
+
+def apply_connection(cfg: Config, form: dict) -> str:
+    cur = sftp_settings(cfg)
+    if not cur:
+        raise SettingsError("The connection wasn't set up by Plex-Cache, so it can't be "
+                            "changed here. Run install.sh --sftp to set it up.")
+    v = validate_connection(form, cur)
+    ok, msg, verified = test_connection(cur, v)
+    if not verified:
+        msg += (f" Note: there's no known_hosts entry for {v['host']}, so its host key "
+                "isn't checked.")
+    if not ok:
+        raise SettingsError(msg + (" Nothing was changed." if form.get("do") != "test" else ""))
+    if form.get("do") == "test":
+        return msg
+    key_file = cur["key_file"]
+    if v["key"] and os.path.dirname(key_file) != CONF_DIR:
+        raise SettingsError("A new key can only be saved when the key lives in "
+                            f"{CONF_DIR}. Re-run install.sh --sftp with --ssh-key instead.")
+    backups = {}
+    for path in [cur["conf"], cfg.mount_env] + ([key_file] if v["key"] else []):
+        with open(path) as f:
+            backups[path] = f.read()
+    if v["key"]:
+        _write_in_place(key_file, v["key"])
+    _write_in_place(cur["conf"], connection_conf(cur, v, key_file)[0])
+    update_env(cfg.mount_env, {"REMOTE": f"{SFTP_SECTION}:{v['path']}",
+                               "MOUNTPOINT": v["mountpoint"]})
+    result = restart_mount_or_revert(backups)
+    if result == "reverted":
+        raise SettingsError("The connection test passed, but the mount wouldn't start with "
+                            "the new settings, so the previous ones were put back. See: "
+                            "journalctl -u plex-cache-mount")
+    if v["mountpoint"] != cur["mountpoint"] and result == "ok":
+        try:  # rclone normally unmounts the old folder itself when it stops
+            subprocess.run(["fusermount", "-uz", cur["mountpoint"]], stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=15)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        msg += (f" Media is now at {v['mountpoint']}; point your Plex libraries there.")
+    if result == "no-restart":
+        return (msg + " Saved, but the mount couldn't be restarted from here. Run: "
+                "sudo systemctl restart plex-cache-mount")
+    return msg + " Saved and the mount restarted."
+
+
 def apply_prefetch_settings(cfg: Config, pf: "Prefetcher", form: dict) -> str:
     values = validate_prefetch(form)
     update_ini(cfg.path, values)
@@ -1205,14 +1513,20 @@ def apply_mount_settings(cfg: Config, form: dict) -> str:
         floor = parse_size(values["CACHE_MIN_FREE"]) or 0
         values["CACHE_MAX_SIZE"] = size_from_percent(cfg.cache_dir, int(values["CACHE_PERCENT"]),
                                                      floor)
+    with open(cfg.mount_env) as f:
+        before = f.read()
     update_env(cfg.mount_env, values)
     # The prefetcher's pre-cache floor follows the mount's.
     floor_gb = max(0, round((parse_size(values["CACHE_MIN_FREE"]) or 0) / 1024 / MB))
     update_ini(cfg.path, {"min_free_gb": str(floor_gb)})
     reload_config(cfg)
     if form.get("restart") == "now":
-        if systemctl_restart("plex-cache-mount"):
+        result = restart_mount_or_revert({cfg.mount_env: before})
+        if result == "ok":
             return f"Cache settings saved (size {values['CACHE_MAX_SIZE']}) and the mount restarted."
+        if result == "reverted":
+            raise SettingsError("The mount wouldn't start with those settings, so the previous "
+                                "ones were put back. Check the extra rclone flags.")
         return ("Cache settings saved, but the mount couldn't be restarted from here. "
                 "Run: sudo systemctl restart plex-cache-mount")
     return (f"Cache settings saved (size {values['CACHE_MAX_SIZE']}). They apply the next time "
@@ -1225,7 +1539,9 @@ def apply_recommended(cfg: Config, pf: "Prefetcher", form: dict) -> str:
     pre.update({k: v for k, v in rec["prefetch"].items() if k in pre})
     apply_prefetch_settings(cfg, pf, pre)
     if read_env_file(cfg.mount_env):
-        return apply_mount_settings(cfg, {**rec["mount"], "restart": form.get("restart", "")}
+        current = read_env_file(cfg.mount_env)
+        return apply_mount_settings(cfg, {**current, **rec["mount"],
+                                          "restart": form.get("restart", "")}
                                     ).replace("Cache settings", "Recommended settings")
     update_ini(cfg.path, {"min_free_gb": rec["prefetch"]["min_free_gb"]})
     reload_config(cfg)
@@ -1323,6 +1639,73 @@ def start_update() -> str:
             "while Plex-Cache restarts; reload it afterwards to see the new version.")
 
 
+SWITCH_SCRIPT = "/usr/local/sbin/plex-cache-switch"
+DISABLED_MARK = "# disabled by Plex-Cache: "
+
+
+def media_mount(cfg: Config, mounts_text: str | None = None) -> dict:
+    """What the media folder is mounted with, and which switch makes sense."""
+    if mounts_text is None:
+        try:
+            with open("/proc/mounts") as f:
+                mounts_text = f.read()
+        except OSError:
+            mounts_text = ""
+    env = read_env_file(cfg.mount_env) if cfg.mount_env else {}
+    where = (env.get("MOUNTPOINT") or "").rstrip("/")
+    mnt, fstype, _ = mount_info(where, mounts_text) if where else ("", "", "")
+    if mnt != where:
+        fstype = ""  # nothing mounted there; maybe the SSHFS mount is somewhere else
+        sshfs = [_unescape_mount(l.split()[1]) for l in mounts_text.splitlines()
+                 if len(l.split()) > 2 and l.split()[2] == "fuse.sshfs"]
+        if len(sshfs) == 1:
+            where, fstype = sshfs[0], "fuse.sshfs"
+    try:
+        with open("/etc/fstab") as f:
+            undo = any(l.startswith(DISABLED_MARK) for l in f)
+    except OSError:
+        undo = False
+    try:
+        with open(os.path.join(INSTALL_DIR, "last-switch")) as f:
+            note = f.read().strip()
+    except OSError:
+        note = ""
+    return {"where": where, "fstype": fstype, "undo": undo or fstype == "fuse.rclone",
+            "note": note}
+
+
+def switch_check() -> str:
+    """Run the switch's read-only test (sudo rule allows exactly this)."""
+    try:
+        res = subprocess.run(["sudo", "-n", SWITCH_SCRIPT, "--check"], capture_output=True,
+                             text=True, timeout=180)
+    except subprocess.TimeoutExpired:
+        raise SettingsError("The test took too long; the server may be unreachable.")
+    except OSError:
+        res = None
+    if res is None or res.stderr.lstrip().startswith("sudo"):
+        raise SettingsError("Couldn't run the test from here. Run: sudo plex-cache-switch --check")
+    lines = [l for l in (res.stdout + "\n" + res.stderr).splitlines() if l.strip()]
+    if res.returncode != 0:
+        raise SettingsError(lines[-1] if lines else "The test failed.")
+    return lines[-1] if lines else "Test passed."
+
+
+def start_switch(back: bool) -> str:
+    unit = "plex-cache-switch-back" if back else "plex-cache-switch"
+    try:
+        ok = subprocess.run(["sudo", "-n", "systemctl", "start", "--no-block", unit],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                            timeout=30).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        ok = False
+    if not ok:
+        raise SettingsError("Couldn't start it from here. Run: sudo plex-cache-switch"
+                            + (" --back" if back else ""))
+    return ("Going back to SSHFS" if back else "Switching to the cached mount") + \
+        (". Plex pauses for a moment. Reload this page in a minute to see how it went.")
+
+
 def set_auto_update(cfg: Config, form: dict) -> str:
     on = form.get("auto_update") in ("on", "true", "1")
     update_ini(cfg.path, {"auto_update": "true" if on else "false"})
@@ -1348,7 +1731,8 @@ def warm_path(cfg: Config, pf: "Prefetcher", rel: str) -> str:
     return f"Queued {len(files)} file(s) from {rel or '/'} for pre-caching."
 
 
-def render_settings(cfg: Config, token: str, msg: str | None, ok: bool) -> str:
+def render_settings(cfg: Config, token: str, msg: str | None, ok: bool,
+                    prefill: dict | None = None) -> str:
     e = html.escape
     env = read_env_file(cfg.mount_env) if cfg.mount_env else {}
     has_mount = bool(env)
@@ -1383,23 +1767,85 @@ def render_settings(cfg: Config, token: str, msg: str | None, ok: bool) -> str:
                      f"{'inputmode=numeric ' if kind == 'percent' else ''}"
                      f"autocomplete=off spellcheck=false>")
             mount += row(label, field, help_, key)
-    banner = (f"<p class='notice {'good' if ok else 'bad'}'>{e(msg)}</p>" if msg else "")
+        mount += "<h4>Advanced rclone settings</h4>"
+        for key, label, kind, help_ in RCLONE_FIELDS:
+            value = env.get(key) or RCLONE_DEFAULTS.get(key, "")
+            field = (f"<input name={key} value='{e(value)}' "
+                     f"autocomplete=off spellcheck=false>")
+            mount += row(label, field, help_, key)
+    # Shown where you are rather than at the top, so saving doesn't lose your place.
+    banner = (f"<div id=toast class='notice toast {'good' if ok else 'bad'}' role=status>"
+              f"<span>{e(msg)}</span><button type=button aria-label=Close "
+              f"onclick=\"this.parentNode.remove()\">&times;</button></div>" if msg else "")
     hidden = f"<input type=hidden name=token value='{token}'>"
     mount_form = f"""
-<form method=post action=settings/mount class=panel>{hidden}
-<h3>Cache</h3>{mount}
+<div class=panel id=s-mount><h3>Cache</h3>
+<form method=post action=settings/mount>{hidden}{mount}
 <label class=check><input type=checkbox name=restart value=now checked>
 Restart the mount now so changes apply (anything playing pauses for a few seconds)</label>
 <button>Save cache settings</button></form>
 <form method=post action=restart-mount class=inline>{hidden}
-<button>Restart mount only</button></form>""" if has_mount else ""
+<button>Restart mount only</button></form></div>""" if has_mount else ""
+    conn_form = ""
+    sftp = sftp_settings(cfg) if has_mount else None
+    if sftp:
+        vals = {**sftp, **(prefill or {})}
+
+        def inp(name: str, label: str, help_: str, extra: str = "") -> str:
+            return row(label, f"<input name={name} value='{e(str(vals.get(name, '')))}' "
+                       f"autocomplete=off spellcheck=false {extra}>", help_)
+        conn_form = f"""
+<form method=post action=settings/connection class=panel id=s-conn>{hidden}
+<h3>Connection to your media server</h3>
+{inp("host", "Server", "Hostname or IP address of the server holding your media.")}
+{inp("user", "User", "")}
+{inp("port", "SSH port", "", "inputmode=numeric")}
+{inp("path", "Folder on the server", "Full path, e.g. /home/me/data.")}
+{inp("mountpoint", "Mount at", "Where the media appears on this box. Your Plex libraries "
+     "point here, so only change it if you'll update them too.")}
+{row("New SSH private key", "<textarea name=key rows=3 placeholder='Leave blank to keep the current key' spellcheck=false></textarea>",
+     "Only needed if the server's key changed. Paste it again when saving after a test.")}
+<button name=do value=test>Test connection</button>
+<button name=do value=save>Test and save</button>
+<p class=muted>Saving tests the connection first and changes nothing if it fails. It then
+restarts the mount, so anything playing pauses for a few seconds; if the mount won't start,
+the previous settings are put back.</p></form>"""
+    elif has_mount and env.get("REMOTE"):
+        conn_form = f"""<div class=panel id=s-conn><h3>Connection to your media server</h3>
+<p>rclone remote <code>{e(env["REMOTE"])}</code>, mounted at <code>{e(env.get("MOUNTPOINT", ""))}</code>.</p>
+<p class=muted>This remote was set up outside Plex-Cache, so it's changed with
+<code>rclone config</code>. To manage an SFTP connection here, run
+<code>sudo ./install.sh --sftp user@host:/path --ssh-key KEY</code>.</p></div>"""
+    switch_form = ""
+    mm = media_mount(cfg) if has_mount else None
+    note_html = (f"<p class=muted>Last switch: {e(mm['note'])}</p>" if mm and mm["note"] else "")
+    if mm and mm["fstype"] == "fuse.sshfs":
+        switch_form = f"""
+<div class='panel badbox' id=s-switch><h3>Switch {e(mm["where"])} from SSHFS to the cached mount</h3>
+<p>Your media is on SSHFS, which can't keep anything on local disk, so pre-caching is paused.
+The switch reads the server, folder and SSH key from the SSHFS mount, checks rclone sees the
+same folders, then swaps the mounts. Plex paths don't change. Plex pauses for a moment, and if
+the new mount doesn't show your files, SSHFS is put back.</p>
+<form method=post action=switch/check class=inline>{hidden}<button>Test first</button></form>
+<form method=post action=switch/run class=inline>{hidden}<button>Switch now</button></form>
+{note_html}</div>"""
+    elif mm and mm["undo"]:
+        switch_form = f"""
+<div class=panel id=s-switch><h3>Media mount</h3>
+<p>{e(mm["where"])} {"is the cached rclone mount." if mm["fstype"] == "fuse.rclone" else
+  "should be the cached rclone mount, but it isn't running, so Plex sees no media. Check "
+  "<code>journalctl -u plex-cache-mount</code>, or go back to SSHFS."}</p>
+<form method=post action=switch/back>{hidden}
+<button>Go back to SSHFS</button>
+<span class=muted>Plex pauses for a moment, and pre-caching stops until you switch again.</span>
+</form>{note_html}</div>"""
     warm_form = f"""
-<form method=post action=warm class=panel>{hidden}<h3>Pre-cache now</h3>
+<form method=post action=warm class=panel id=s-warm>{hidden}<h3>Pre-cache now</h3>
 {row("Folder or file", "<input name=path placeholder='TV/Some Show/Season 1' autocomplete=off>",
      "Path inside " + (env.get("MOUNTPOINT") or "the media folder") + ". Up to 500 files are queued.")}
 <button>Pre-cache</button></form>""" if has_mount else ""
     rec_form = f"""
-<form method=post action=settings/recommended class='panel recbox'>{hidden}
+<form method=post action=settings/recommended class='panel recbox' id=s-rec>{hidden}
 <h3>Recommended settings</h3>
 <p class=muted>Worked out from this server: {e(rec["basis"])}. Cache
 {e(rec["mount"]["CACHE_MAX_SIZE"])} (60% of usable disk), keep {e(rec["mount"]["CACHE_MIN_FREE"])}
@@ -1411,7 +1857,7 @@ download(s) at once.</p>
 <button>Use recommended settings</button></form>""" if rec else ""
     note = last_update_note()
     update_form = f"""
-<div class=panel><h3>Updates</h3>
+<div class=panel id=s-update><h3>Updates</h3>
 <p>Version <b>{e(version_label())}</b>
 <span class=muted>· build {e(installed_version())}</span>
 {('<br><span class=muted>Last update: ' + e(note) + '</span>') if note else ''}</p>
@@ -1424,23 +1870,51 @@ onchange="this.form.submit()"> Install updates automatically each night</label>
 <p class=muted>Updates keep all your settings. Over SSH: <code>sudo plex-cache-update</code>.
 <a href="{UPDATE_REPO}/blob/main/CHANGELOG.md" target=_blank rel=noopener>What's new</a></p></div>"""
     return f"""<section id=settings><h2>Settings</h2>{banner}{rec_form}
-<form method=post action=settings/prefetch class=panel>{hidden}<h3>Pre-caching</h3>{pre}
+<form method=post action=settings/prefetch class=panel id=s-prefetch>{hidden}<h3>Pre-caching</h3>{pre}
 <button>Save pre-cache settings</button>
 <span class=muted>Applies immediately.</span></form>
-{mount_form}{warm_form}{update_form}</section>"""
+{switch_form}{conn_form}{mount_form}{warm_form}{update_form}</section>"""
 
 
 SETTINGS_CSS = """
 #settings .panel{background:var(--card);border-radius:6px;padding:12px;margin:12px 0}
+.tabs{display:flex;gap:4px;margin:14px 0 0;border-bottom:1px solid var(--line)}
+.tabs a{padding:8px 14px;color:var(--muted);text-decoration:none;font-weight:600;
+border-bottom:2px solid transparent;margin-bottom:-1px}
+.tabs a.on{color:var(--fg);border-bottom-color:var(--info)}
+#settings h3[role=button]{cursor:pointer;margin:0;user-select:none}
+#settings h3[role=button]::before{content:"\\25BE";display:inline-block;width:1.2em;
+font-size:12px;vertical-align:1px;
+transition:transform .15s}
+#settings .collapsed h3[role=button]::before{transform:rotate(-90deg)}
+#settings .panel:not(.collapsed) h3[role=button]{margin-bottom:8px}
+#settings .panel.collapsed>:not(h3){display:none}
 #settings h3{font-size:15px;margin:0 0 8px}.field{display:block;margin:10px 0}
 .field span{display:block;font-weight:600;font-size:14px;margin-bottom:3px}
+#settings h4{font-size:14px;margin:16px 0 4px}
+.field textarea{font:12px monospace;width:100%;max-width:520px;box-sizing:border-box;
+background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:4px}
 .field input:not([type=checkbox]){font:inherit;padding:5px 8px;width:100%;max-width:260px;
 box-sizing:border-box;background:var(--bg);color:var(--fg);border:1px solid var(--line);
 border-radius:4px}.check{display:block;margin:10px 0;font-size:14px}
 #settings button{margin-top:6px}.rec{color:var(--info);font-size:13px}
-.recbox{border-left:4px solid var(--info)}.inline{display:inline}
-.notice{padding:8px 12px;border-radius:6px;color:#fff}.notice.good{background:var(--good)}
+.recbox{border-left:4px solid var(--info)}.badbox{border-left:4px solid var(--warn)}.inline{display:inline}
+.notice{padding:8px 12px;border-radius:6px;color:#fff}
+.toast{position:fixed;left:50%;bottom:16px;transform:translateX(-50%);z-index:10;
+width:max-content;max-width:calc(100% - 32px);box-sizing:border-box;display:flex;gap:12px;
+align-items:flex-start;box-shadow:0 4px 16px rgba(0,0,0,.3);transition:opacity .4s}
+.toast button{background:none;border:0;color:#fff;font-size:18px;line-height:1;
+cursor:pointer;margin:0!important;padding:0}.notice.good{background:var(--good)}
 .notice.bad{background:var(--bad)}"""
+
+
+# Where the page lands after each form, when JavaScript can't restore the scroll position.
+PANEL_FOR_ACTION = {
+    "settings/prefetch": "s-prefetch", "settings/mount": "s-mount", "restart-mount": "s-mount",
+    "settings/connection": "s-conn", "settings/recommended": "s-rec", "warm": "s-warm",
+    "switch/check": "s-switch", "switch/run": "s-switch", "switch/back": "s-switch",
+    "update/check": "s-update", "update/run": "s-update", "update/auto": "s-update",
+}
 
 
 def start_status_server(cfg: Config, pf: Prefetcher) -> None:
@@ -1463,7 +1937,8 @@ def start_status_server(cfg: Config, pf: Prefetcher) -> None:
                 return
             msg = last_msg.pop("text", None) if "saved=1" in self.path else None
             ok = last_msg.pop("ok", True)
-            settings = render_settings(cfg, token, msg, ok) if cfg.path else ""
+            prefill = last_msg.pop("conn", None) if msg else None
+            settings = render_settings(cfg, token, msg, ok, prefill) if cfg.path else ""
             self._send(render_status(data, settings).encode(), "text/html; charset=utf-8")
 
         def do_POST(self):
@@ -1479,8 +1954,21 @@ def start_status_server(cfg: Config, pf: Prefetcher) -> None:
                     text = apply_prefetch_settings(cfg, pf, form)
                 elif action == ["settings", "mount"]:
                     text = apply_mount_settings(cfg, form)
+                elif action == ["settings", "connection"]:
+                    # Keep what was typed (not the key) so a test can be followed by a save.
+                    last_msg["conn"] = {k: form.get(k, "") for k in
+                                        ("host", "user", "port", "path", "mountpoint")}
+                    text = apply_connection(cfg, form)
+                    if form.get("do") != "test":
+                        last_msg.pop("conn", None)
                 elif action == ["settings", "recommended"]:
                     text = apply_recommended(cfg, pf, form)
+                elif action == ["switch", "check"]:
+                    text = switch_check()
+                elif action == ["switch", "run"]:
+                    text = start_switch(back=False)
+                elif action == ["switch", "back"]:
+                    text = start_switch(back=True)
                 elif action == ["update", "check"]:
                     text = check_for_update()
                 elif action == ["update", "run"]:
@@ -1503,8 +1991,10 @@ def start_status_server(cfg: Config, pf: Prefetcher) -> None:
                 last_msg.update(text=str(err), ok=False)
             # Back to the page; relative so it works behind nginx's /plexcache/ prefix.
             depth = self.path.split("?")[0].strip("/").count("/")
+            anchor = PANEL_FOR_ACTION.get("/".join(action), PANEL_FOR_ACTION.get(action[-1],
+                                                                                  "settings"))
             self.send_response(303)
-            self.send_header("Location", "../" * depth + "./?saved=1#settings")
+            self.send_header("Location", "../" * depth + "./?saved=1#" + anchor)
             self.end_headers()
 
         def log_message(self, *_args):

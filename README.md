@@ -64,29 +64,31 @@ still cross the WAN. The installer can switch you to rclone's SFTP backend,
 which uses the same server, SSH key and path, and mounts at the same place so
 your Plex libraries don't change.
 
-Take the values from your current SSHFS command. For
-`sshfs ... -o IdentityFile=~/.ssh/hostname username@serverIP:/home/username/data/ /data`:
+The status page has a **Switch to the cached mount** button whenever your media
+is on SSHFS, with **Test first** to check without changing anything. Over SSH:
 
 ```bash
 sudo box install rclone
-sudo ./install.sh --sftp username@serverIP:/home/username/data \
-     --ssh-key /root/.ssh/hostname --mountpoint /data --replace-sshfs
+sudo ./install.sh --replace-sshfs --mountpoint /data   # first install
+sudo plex-cache-switch                                  # once installed
 sudo systemctl enable --now plex-precache
 ```
 
-Use the full path of the key (`~` above is the home folder of whoever ran
-SSHFS, usually `/root`), and add `--ssh-port` if the server isn't on 22.
+The switch reads the server, user, folder, port and SSH key from the SSHFS
+mount and `/etc/fstab`. If the mount was made by hand, it tries the private
+keys in `/root/.ssh` and the Swizzin user's `~/.ssh`. To give them yourself:
+`--sftp username@serverIP:/home/username/data --ssh-key /root/.ssh/hostname
+[--ssh-port 22]`.
 
-The installer copies the key to `/etc/plex-precache/ssh_key` and writes an
-rclone config in `/etc/plex-precache/` without touching yours. It checks
-that rclone can list the remote **before** changing anything. With
-`--replace-sshfs` it then comments the SSHFS line out of `/etc/fstab` (keeping
-a dated backup), unmounts SSHFS, and starts the cached mount at `/data`. Plex
-is stopped for those few seconds. Leave `--replace-sshfs` off to set
-everything up without swapping, and do the swap yourself later.
+Nothing changes unless rclone can list the folder **and** sees the same
+folders SSHFS shows. Then it copies the key to `/etc/plex-precache/ssh_key`,
+writes its own rclone config there (yours is left alone), comments the SSHFS
+line out of `/etc/fstab` (keeping a dated backup), stops Plex, unmounts SSHFS
+and starts the cached mount at the same place. If the cached mount doesn't come
+up showing your files, SSHFS is put back. Plex is always started again.
 
-To go back: `sudo systemctl disable --now plex-cache-mount`, restore
-`/etc/fstab` from the `/etc/fstab.plex-cache.*` backup, then `sudo mount -a`.
+To go back: **Go back to SSHFS** on the status page, or
+`sudo plex-cache-switch --back`. `box remove plexcache` also does this first.
 
 If SSHFS is mounted by a script or service rather than fstab, disable that
 too, or it will try to mount over the new mount at boot.
@@ -132,8 +134,17 @@ The bottom of the status page has a **Settings** section:
   Plex.
 - **Cache** (restarts the mount, so playback pauses for a few seconds): cache
   size as a fixed amount or a % of usable disk, disk to keep free, how long
-  unwatched files are kept, read-ahead and RAM buffer per stream. There's
-  also a restart-only button.
+  unwatched files are kept, read-ahead and RAM buffer per stream. Under
+  **Advanced rclone settings**: chunk size, how long folder listings are
+  trusted, and extra rclone mount flags such as `--bwlimit 80M`. If the mount
+  won't start after a change, the previous settings are put back
+  automatically. There's also a restart-only button.
+- **Connection to your media server**: server, user, SSH port, folder on the
+  server, where it's mounted, and optionally a new SSH key. **Test connection**
+  lists the folder with the new details without changing anything; **Test and
+  save** only saves if that test passes, then restarts the mount. This works
+  for the SFTP connection Plex-Cache set up; any other remote is
+  shown but changed with `rclone config`.
 - **Pre-cache now**: queue a folder or file under the media folder, such as a
   season you're about to watch (up to 500 files at a time).
 
@@ -142,9 +153,10 @@ The bottom of the status page has a **Settings** section:
 - **Updates**: shows the installed version, checks GitHub, installs the latest
   version, and turns on nightly automatic updates.
 
-The Plex token, remote and mount location stay command-line only. To make the
-page work, the installer gives the service user ownership of
-`/etc/plex-precache/config.ini` and `rclone-mount.env`. It also adds a sudo rule
+The Plex token stays command-line only. To make the page work, the installer
+gives the service user (which also runs the mount) ownership of
+`/etc/plex-precache/config.ini`, `rclone-mount.env`, `rclone.conf` and the
+copied SSH key. It also adds a sudo rule
 (`/etc/sudoers.d/plex-cache`) that lets that user run exactly
 `systemctl restart plex-cache-mount` and `systemctl restart plex-precache`, and
 nothing else. Forms carry a per-run token, so other websites can't submit them

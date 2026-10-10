@@ -9,7 +9,7 @@ Type=notify
 User=@USER@
 Group=@USER@
 EnvironmentFile=/etc/plex-precache/rclone-mount.env
-ExecStart=/usr/bin/rclone mount ${REMOTE} ${MOUNTPOINT} \
+ExecStart=@RCLONE@ mount ${REMOTE} ${MOUNTPOINT} \
   --config ${RCLONE_CONFIG} \
   --allow-other \
   --vfs-cache-mode full \
@@ -19,9 +19,9 @@ ExecStart=/usr/bin/rclone mount ${REMOTE} ${MOUNTPOINT} \
   --vfs-cache-min-free-space ${CACHE_MIN_FREE} \
   --vfs-read-ahead ${READ_AHEAD} \
   --buffer-size ${BUFFER_SIZE} \
-  --vfs-read-chunk-size 64M \
+  --vfs-read-chunk-size ${VFS_CHUNK_SIZE} \
   --vfs-read-chunk-size-limit 2G \
-  --dir-cache-time 1h \
+  --dir-cache-time ${DIR_CACHE_TIME} \
   --umask 002 \
   $EXTRA_ARGS
 ExecStop=/bin/sh -c 'fusermount -uz "$MOUNTPOINT" 2>/dev/null || fusermount3 -uz "$MOUNTPOINT"'
