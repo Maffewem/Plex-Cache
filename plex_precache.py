@@ -1570,6 +1570,73 @@ def start_update() -> str:
             "while Plex-Cache restarts; reload it afterwards to see the new version.")
 
 
+SWITCH_SCRIPT = "/usr/local/sbin/plex-cache-switch"
+DISABLED_MARK = "# disabled by Plex-Cache: "
+
+
+def media_mount(cfg: Config, mounts_text: str | None = None) -> dict:
+    """What the media folder is mounted with, and which switch makes sense."""
+    if mounts_text is None:
+        try:
+            with open("/proc/mounts") as f:
+                mounts_text = f.read()
+        except OSError:
+            mounts_text = ""
+    env = read_env_file(cfg.mount_env) if cfg.mount_env else {}
+    where = (env.get("MOUNTPOINT") or "").rstrip("/")
+    mnt, fstype, _ = mount_info(where, mounts_text) if where else ("", "", "")
+    if mnt != where:
+        fstype = ""  # nothing mounted there; maybe the SSHFS mount is somewhere else
+        sshfs = [_unescape_mount(l.split()[1]) for l in mounts_text.splitlines()
+                 if len(l.split()) > 2 and l.split()[2] == "fuse.sshfs"]
+        if len(sshfs) == 1:
+            where, fstype = sshfs[0], "fuse.sshfs"
+    try:
+        with open("/etc/fstab") as f:
+            undo = any(l.startswith(DISABLED_MARK) for l in f)
+    except OSError:
+        undo = False
+    try:
+        with open(os.path.join(INSTALL_DIR, "last-switch")) as f:
+            note = f.read().strip()
+    except OSError:
+        note = ""
+    return {"where": where, "fstype": fstype, "undo": undo or fstype == "fuse.rclone",
+            "note": note}
+
+
+def switch_check() -> str:
+    """Run the switch's read-only test (sudo rule allows exactly this)."""
+    try:
+        res = subprocess.run(["sudo", "-n", SWITCH_SCRIPT, "--check"], capture_output=True,
+                             text=True, timeout=180)
+    except subprocess.TimeoutExpired:
+        raise SettingsError("The test took too long; the server may be unreachable.")
+    except OSError:
+        res = None
+    if res is None or res.stderr.lstrip().startswith("sudo"):
+        raise SettingsError("Couldn't run the test from here. Run: sudo plex-cache-switch --check")
+    lines = [l for l in (res.stdout + "\n" + res.stderr).splitlines() if l.strip()]
+    if res.returncode != 0:
+        raise SettingsError(lines[-1] if lines else "The test failed.")
+    return lines[-1] if lines else "Test passed."
+
+
+def start_switch(back: bool) -> str:
+    unit = "plex-cache-switch-back" if back else "plex-cache-switch"
+    try:
+        ok = subprocess.run(["sudo", "-n", "systemctl", "start", "--no-block", unit],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                            timeout=30).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        ok = False
+    if not ok:
+        raise SettingsError("Couldn't start it from here. Run: sudo plex-cache-switch"
+                            + (" --back" if back else ""))
+    return ("Going back to SSHFS" if back else "Switching to the cached mount") + \
+        (". Plex pauses for a moment. Reload this page in a minute to see how it went.")
+
+
 def set_auto_update(cfg: Config, form: dict) -> str:
     on = form.get("auto_update") in ("on", "true", "1")
     update_ini(cfg.path, {"auto_update": "true" if on else "false"})
@@ -1677,6 +1744,27 @@ the previous settings are put back.</p></form>"""
 <p class=muted>This remote was set up outside Plex-Cache, so it's changed with
 <code>rclone config</code>. To manage an SFTP connection here, run
 <code>sudo ./install.sh --sftp user@host:/path --ssh-key KEY</code>.</p></div>"""
+    switch_form = ""
+    mm = media_mount(cfg) if has_mount else None
+    note_html = (f"<p class=muted>Last switch: {e(mm['note'])}</p>" if mm and mm["note"] else "")
+    if mm and mm["fstype"] == "fuse.sshfs":
+        switch_form = f"""
+<div class='panel badbox'><h3>Switch {e(mm["where"])} from SSHFS to the cached mount</h3>
+<p>Your media is on SSHFS, which can't keep anything on local disk, so pre-caching is paused.
+The switch reads the server, folder and SSH key from the SSHFS mount, checks rclone sees the
+same folders, then swaps the mounts. Plex paths don't change. Plex pauses for a moment, and if
+the new mount doesn't show your files, SSHFS is put back.</p>
+<form method=post action=switch/check class=inline>{hidden}<button>Test first</button></form>
+<form method=post action=switch/run class=inline>{hidden}<button>Switch now</button></form>
+{note_html}</div>"""
+    elif mm and mm["undo"]:
+        switch_form = f"""
+<div class=panel><h3>Media mount</h3>
+<p>{e(mm["where"])} is the cached rclone mount.</p>
+<form method=post action=switch/back>{hidden}
+<button>Go back to SSHFS</button>
+<span class=muted>Plex pauses for a moment, and pre-caching stops until you switch again.</span>
+</form>{note_html}</div>"""
     warm_form = f"""
 <form method=post action=warm class=panel>{hidden}<h3>Pre-cache now</h3>
 {row("Folder or file", "<input name=path placeholder='TV/Some Show/Season 1' autocomplete=off>",
@@ -1711,7 +1799,7 @@ onchange="this.form.submit()"> Install updates automatically each night</label>
 <form method=post action=settings/prefetch class=panel>{hidden}<h3>Pre-caching</h3>{pre}
 <button>Save pre-cache settings</button>
 <span class=muted>Applies immediately.</span></form>
-{conn_form}{mount_form}{warm_form}{update_form}</section>"""
+{switch_form}{conn_form}{mount_form}{warm_form}{update_form}</section>"""
 
 
 SETTINGS_CSS = """
@@ -1725,7 +1813,7 @@ background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:
 box-sizing:border-box;background:var(--bg);color:var(--fg);border:1px solid var(--line);
 border-radius:4px}.check{display:block;margin:10px 0;font-size:14px}
 #settings button{margin-top:6px}.rec{color:var(--info);font-size:13px}
-.recbox{border-left:4px solid var(--info)}.inline{display:inline}
+.recbox{border-left:4px solid var(--info)}.badbox{border-left:4px solid var(--warn)}.inline{display:inline}
 .notice{padding:8px 12px;border-radius:6px;color:#fff}.notice.good{background:var(--good)}
 .notice.bad{background:var(--bad)}"""
 
@@ -1776,6 +1864,12 @@ def start_status_server(cfg: Config, pf: Prefetcher) -> None:
                         last_msg.pop("conn", None)
                 elif action == ["settings", "recommended"]:
                     text = apply_recommended(cfg, pf, form)
+                elif action == ["switch", "check"]:
+                    text = switch_check()
+                elif action == ["switch", "run"]:
+                    text = start_switch(back=False)
+                elif action == ["switch", "back"]:
+                    text = start_switch(back=True)
                 elif action == ["update", "check"]:
                     text = check_for_update()
                 elif action == ["update", "run"]:

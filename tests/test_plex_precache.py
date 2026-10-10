@@ -522,6 +522,27 @@ class RcloneSettingsTests(unittest.TestCase):
         self.assertEqual((out["VFS_CHUNK_SIZE"], out["DIR_CACHE_TIME"], out["EXTRA_ARGS"]),
                          ("64M", "1h", ""))
 
+
+    def test_media_mount_offers_the_right_switch(self):
+        env = {"MOUNTPOINT": self.mnt}
+        pp.update_env(self.env, env)
+        sshfs = f"u@h:/data {self.mnt} fuse.sshfs rw 0 0\n"
+        rclone = f"plexcache-sftp: {self.mnt} fuse.rclone rw 0 0\n"
+        self.assertEqual(pp.media_mount(self.cfg, sshfs)["fstype"], "fuse.sshfs")
+        self.assertTrue(pp.media_mount(self.cfg, rclone)["undo"])
+        # The settings point elsewhere, but there's exactly one SSHFS mount.
+        other = "u@h:/data /media/x fuse.sshfs rw 0 0\n"
+        self.assertEqual(pp.media_mount(self.cfg, other)["where"], "/media/x")
+        with mock.patch.object(pp, "media_mount", lambda cfg: {
+                "where": self.mnt, "fstype": "fuse.sshfs", "undo": False,
+                "note": "2026-10-10 11:00 Test passed"}):
+            page = pp.render_settings(self.cfg, "t", None, True)
+        self.assertIn("action=switch/run", page)
+        self.assertIn("Last switch: 2026-10-10 11:00 Test passed", page)
+        with mock.patch.object(pp, "media_mount", lambda cfg: {
+                "where": self.mnt, "fstype": "fuse.rclone", "undo": True, "note": ""}):
+            self.assertIn("action=switch/back", pp.render_settings(self.cfg, "t", None, True))
+
     def test_failed_restart_puts_old_files_back(self):
         with open(self.env) as f:
             old = f.read()

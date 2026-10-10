@@ -12,8 +12,14 @@ if [ -f /etc/plex-precache/rclone-mount.env ]; then
   CACHE_DIR="$(sed -n 's/^CACHE_DIR=//p' /etc/plex-precache/rclone-mount.env)"
 fi
 
+# Put SSHFS back first if Plex-Cache replaced it, so Plex keeps its media.
+if grep -q "^# disabled by Plex-Cache: " /etc/fstab 2>/dev/null && [ -x /usr/local/sbin/plex-cache-switch ]; then
+  /usr/local/sbin/plex-cache-switch --back
+fi
+
 for unit in plex-precache.service plex-cache-mount.service plex-cache-autoupdate.timer \
-            plex-cache-autoupdate.service plex-cache-update.service; do
+            plex-cache-autoupdate.service plex-cache-update.service \
+            plex-cache-switch.service plex-cache-switch-back.service; do
   systemctl disable --now "$unit" 2>/dev/null
   rm -f "/etc/systemd/system/$unit"
 done
@@ -30,7 +36,7 @@ if [ -f "$PROFILES" ] && grep -q "BEGIN plex-cache" "$PROFILES"; then
   systemctl restart panel 2>/dev/null
 fi
 rm -f /install/.plexcache.lock /etc/swizzin/scripts/remove/plexcache.sh
-rm -f /usr/local/bin/plex-cache-resize /usr/local/sbin/plex-cache-update /etc/sudoers.d/plex-cache
+rm -f /usr/local/bin/plex-cache-resize /usr/local/sbin/plex-cache-update /usr/local/sbin/plex-cache-switch /etc/sudoers.d/plex-cache
 rm -rf /opt/plex-precache
 
 if [ "$PURGE" -eq 1 ]; then

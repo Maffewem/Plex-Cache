@@ -9,7 +9,7 @@ Type=notify
 User=@USER@
 Group=@USER@
 EnvironmentFile=/etc/plex-precache/rclone-mount.env
-ExecStart=/usr/bin/rclone mount ${REMOTE} ${MOUNTPOINT} \
+ExecStart=@RCLONE@ mount ${REMOTE} ${MOUNTPOINT} \
   --config ${RCLONE_CONFIG} \
   --allow-other \
   --vfs-cache-mode full \

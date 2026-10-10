@@ -13,8 +13,10 @@ The version is shown on the status page (`/plexcache/`) and by
 - Updates: `sudo plex-cache-update`, an Update button on the page, or
   nightly automatic updates. The updater never installs an older version than
   the one running.
-- Switch from SSHFS to a cached rclone SFTP mount with
-  `install.sh --sftp ... --replace-sshfs`.
+- Switch from SSHFS to a cached rclone SFTP mount from the status page or with
+  `sudo plex-cache-switch`. It finds the server, folder and key itself, only
+  switches when rclone sees the same folders, puts SSHFS back if the new mount
+  doesn't show your files, and can switch back later.
 - Pre-caching pauses on mounts that can't cache (such as SSHFS) instead of
   competing with Plex for bandwidth.
 - Downloads stop once nobody has watched the stream for 10 minutes

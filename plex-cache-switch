@@ -1,0 +1,277 @@
+#!/usr/bin/env bash
+# Move the media mount from SSHFS to Plex-Cache's cached rclone mount, or back.
+#
+#   sudo plex-cache-switch            # find the SSHFS mount, test rclone, then switch
+#   sudo plex-cache-switch --check    # only test; changes nothing
+#   sudo plex-cache-switch --back     # go back to SSHFS
+#
+# With no other options it reads the server, user, path, port and key from the
+# SSHFS mount and /etc/fstab. Give them yourself with:
+#   --sftp user@host:/path --ssh-key /root/.ssh/key [--ssh-port 22] [--mountpoint /data]
+#   --configure-only   write the rclone settings but leave the mounts alone
+#
+# The switch only happens if rclone can list the same folder SSHFS shows. If the
+# cached mount doesn't come up with your files, SSHFS is put back automatically.
+# Plex is stopped for the switch and always started again.
+set -euo pipefail
+
+CONF_DIR=/etc/plex-precache
+ENV_FILE=$CONF_DIR/rclone-mount.env
+RCLONE_CONF=$CONF_DIR/rclone.conf
+UNIT=/etc/systemd/system/plex-cache-mount.service
+STATUS_FILE=/opt/plex-precache/last-switch
+MODE=switch SFTP="" SSH_KEY="" SSH_PORT="" MOUNT_AT="" CONFIGURE_ONLY=0
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --check) MODE=check ;;
+    --back) MODE=back ;;
+    --sftp) SFTP="$2"; shift ;;
+    --ssh-key) SSH_KEY="$2"; shift ;;
+    --ssh-port) SSH_PORT="$2"; shift ;;
+    --mountpoint) MOUNT_AT="$2"; shift ;;
+    --configure-only) CONFIGURE_ONLY=1 ;;
+    -h|--help) sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "unknown option: $1" >&2; exit 1 ;;
+  esac
+  shift
+done
+
+[ "$(id -u)" -eq 0 ] || { echo "run as root (sudo)" >&2; exit 1; }
+[ -f "$ENV_FILE" ] && [ -f "$UNIT" ] || {
+  echo "The cached mount isn't installed; run install.sh --with-mount first." >&2; exit 1; }
+RUN_USER="$(sed -n 's/^User=//p' "$UNIT")"
+RCLONE="$(command -v rclone || true)"
+[ -n "$RCLONE" ] || { echo "rclone not found: install it first (box install rclone)" >&2; exit 1; }
+
+say() {  # progress line, also kept for the status page
+  echo "$1"
+  printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M')" "$1" > "$STATUS_FILE" 2>/dev/null || true
+}
+fail() { say "$1"; exit 1; }
+
+env_get() { sed -n "s/^$1=//p" "$ENV_FILE" | tail -1 | sed 's/^"\(.*\)"$/\1/'; }
+set_env() {  # key value; values with spaces are quoted so bash can source the file
+  local v="$2"
+  case "$v" in *[[:space:]]*) v="\"$v\"" ;; esac
+  if grep -q "^$1=" "$ENV_FILE"; then
+    sed -i "s|^$1=.*|$1=$v|" "$ENV_FILE"
+  else
+    echo "$1=$v" >> "$ENV_FILE"
+  fi
+}
+
+MOUNTPOINT="${MOUNT_AT:-$(env_get MOUNTPOINT)}"
+MOUNTPOINT="${MOUNTPOINT%/}"
+if [ -z "$MOUNT_AT" ] && [ "$MODE" != back ] && [ -z "$SFTP" ] \
+   && ! findmnt -n --mountpoint "$MOUNTPOINT" >/dev/null 2>&1; then
+  # Nothing mounted where the settings say; use the SSHFS mount if there's just one.
+  only="$(findmnt -n -l -t fuse.sshfs -o TARGET 2>/dev/null || true)"
+  [ "$(grep -c . <<<"$only" || true)" -eq 1 ] && MOUNTPOINT="$only"
+fi
+[ -n "$MOUNTPOINT" ] || fail "No mount location; pass --mountpoint /data."
+
+fstype() { findmnt -n -o FSTYPE --mountpoint "$MOUNTPOINT" 2>/dev/null | tail -1; }
+# Active fstab lines that mount SSHFS at $MOUNTPOINT.
+AT="[[:space:]]${MOUNTPOINT}/?[[:space:]]"
+fstab_sshfs() { grep -E "^[^#]" /etc/fstab 2>/dev/null | grep -E "$AT" | grep sshfs || true; }
+DISABLED="# disabled by Plex-Cache: "
+
+# ---- Going back to SSHFS -------------------------------------------------------
+sshfs_up() {  # mount SSHFS again: from fstab if it was there, else from the rclone settings
+  if grep -E "^${DISABLED}" /etc/fstab | grep -qE "$AT"; then
+    sed -i -E "s|^${DISABLED}(.*${AT})|\\1|" /etc/fstab
+    systemctl daemon-reload
+    mount "$MOUNTPOINT"
+  else
+    local host user port key path
+    host="$(sed -n 's/^host = //p' "$RCLONE_CONF")"; user="$(sed -n 's/^user = //p' "$RCLONE_CONF")"
+    port="$(sed -n 's/^port = //p' "$RCLONE_CONF")"; key="$(sed -n 's/^key_file = //p' "$RCLONE_CONF")"
+    path="$(env_get REMOTE)"; path="${path#*:}"
+    command -v sshfs >/dev/null || return 1
+    sshfs -o "allow_other,reconnect,ServerAliveInterval=15,ServerAliveCountMax=3,IdentityFile=$key,port=${port:-22}" \
+      "$user@$host:$path" "$MOUNTPOINT"
+  fi
+}
+
+if [ "$MODE" = back ]; then
+  [ "$(fstype)" = fuse.sshfs ] && { say "$MOUNTPOINT is already on SSHFS."; exit 0; }
+  trap 'systemctl start plexmediaserver 2>/dev/null || true' EXIT
+  systemctl stop plexmediaserver 2>/dev/null || true
+  systemctl disable --now plex-cache-mount 2>/dev/null || true
+  fusermount -uz "$MOUNTPOINT" 2>/dev/null || true
+  if sshfs_up && [ "$(fstype)" = fuse.sshfs ]; then
+    say "Back on SSHFS at $MOUNTPOINT. Pre-caching pauses until you switch again."
+  else
+    fail "Couldn't mount SSHFS at $MOUNTPOINT again; mount it the way you did before."
+  fi
+  exit 0
+fi
+
+# ---- Work out the SFTP details --------------------------------------------------
+SRC="" OPTS=""
+if [ -z "$SFTP" ]; then
+  if [ "$(fstype)" = fuse.sshfs ]; then
+    SRC="$(findmnt -n -o SOURCE --mountpoint "$MOUNTPOINT" | tail -1)"
+  fi
+  line="$(fstab_sshfs | head -1)"
+  if [ -n "$line" ]; then
+    first="$(awk '{print $1}' <<<"$line")"
+    [ -n "$SRC" ] || SRC="${first#sshfs#}"
+    OPTS="$(awk '{print $4}' <<<"$line")"
+  fi
+  [ -n "$SRC" ] || fail "No SSHFS mount found at $MOUNTPOINT. Pass --sftp user@host:/path --ssh-key KEY."
+  SFTP="$SRC"
+fi
+case "$SFTP" in *@*:*) ;; *) fail "Can't read the SSHFS source '$SFTP'; pass --sftp user@host:/path." ;; esac
+SFTP_USER="${SFTP%%@*}" REST="${SFTP#*@}"
+SFTP_HOST="${REST%%:*}" SFTP_PATH="${REST#*:}"
+case "$SFTP_PATH" in
+  /*) ;;
+  *) SFTP_PATH="/home/$SFTP_USER/${SFTP_PATH}" ;;  # sshfs paths without / are relative to home
+esac
+SFTP_PATH="${SFTP_PATH%/}"; SFTP_PATH="${SFTP_PATH:-/}"
+if [ -z "$SSH_PORT" ]; then
+  SSH_PORT="$(tr ',' '\n' <<<"$OPTS" | sed -n 's/^port=//p' | head -1)"
+  SSH_PORT="${SSH_PORT:-22}"
+fi
+
+# Keys to try: the one given, the fstab IdentityFile, the current copy, then any
+# private key root or the Swizzin master user has.
+MASTER="$(cut -d: -f1 2>/dev/null < /root/.master.info || true)"
+CANDIDATES=()
+[ -n "$SSH_KEY" ] && CANDIDATES+=("$SSH_KEY")
+ID="$(tr ',' '\n' <<<"$OPTS" | sed -n 's/^IdentityFile=//p' | head -1)"
+[ -n "$ID" ] && CANDIDATES+=("${ID/#\~//root}")
+[ -f "$CONF_DIR/ssh_key" ] && CANDIDATES+=("$CONF_DIR/ssh_key")
+if [ -z "$SSH_KEY" ]; then
+  for dir in /root/.ssh ${MASTER:+"/home/$MASTER/.ssh"}; do
+    for f in "$dir"/*; do
+      [ -f "$f" ] && head -c 40 "$f" 2>/dev/null | grep -q -- '-----BEGIN' && CANDIDATES+=("$f")
+    done
+  done
+fi
+[ ${#CANDIDATES[@]} -gt 0 ] || fail "No SSH key found; pass --ssh-key with the key SSHFS uses."
+
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+chown "$RUN_USER": "$TMP"
+
+write_conf() {  # dest key_file known_hosts_copy; sets KNOWN_HOSTS_SRC
+  local kh=""
+  KNOWN_HOSTS_SRC=""
+  for f in "$(dirname "$KEY")/known_hosts" /root/.ssh/known_hosts ${MASTER:+"/home/$MASTER/.ssh/known_hosts"}; do
+    if [ -f "$f" ] && { ssh-keygen -F "$SFTP_HOST" -f "$f" >/dev/null 2>&1 \
+                        || ssh-keygen -F "[$SFTP_HOST]:$SSH_PORT" -f "$f" >/dev/null 2>&1 \
+                        || grep -qE "(^|,|\[)${SFTP_HOST}[],[:space:]]" "$f"; }; then
+      KNOWN_HOSTS_SRC="$f"
+      install -m 644 "$f" "$3"
+      kh="known_hosts_file = $3"
+      break
+    fi
+  done
+  cat > "$1" <<RCONF
+[plexcache-sftp]
+type = sftp
+host = $SFTP_HOST
+user = $SFTP_USER
+port = $SSH_PORT
+key_file = $2
+$kh
+shell_type = unix
+md5sum_command = none
+sha1sum_command = none
+disable_hashcheck = true
+RCONF
+  chown "$RUN_USER": "$1"
+  chmod 600 "$1"
+}
+
+list_remote() {  # conf -> folder names, one per line
+  sudo -u "$RUN_USER" "$RCLONE" --config "$1" lsf --max-depth 1 --contimeout 15s --timeout 30s \
+    --retries 1 --low-level-retries 1 "plexcache-sftp:$SFTP_PATH" 2>"$TMP/err" | sed 's|/$||'
+}
+
+KEY="" KNOWN_HOSTS_SRC="" REMOTE_LIST=""
+for k in "${CANDIDATES[@]}"; do
+  [ -f "$k" ] || continue
+  install -m 600 -o "$RUN_USER" -g "$RUN_USER" "$k" "$TMP/key"
+  KEY="$k"
+  write_conf "$TMP/rclone.conf" "$TMP/key" "$TMP/known_hosts"
+  if REMOTE_LIST="$(list_remote "$TMP/rclone.conf")"; then
+    break
+  fi
+  KEY=""
+done
+if [ -z "$KEY" ]; then
+  why="$(grep -v '^\s*$' "$TMP/err" 2>/dev/null | tail -1 | sed 's/^[0-9/]* [0-9:]* [A-Z]* *: *//')"
+  fail "rclone couldn't connect to $SFTP_USER@$SFTP_HOST:$SFTP_PATH (port $SSH_PORT) with any SSH key${why:+: $why}. Nothing was changed."
+fi
+COUNT="$(grep -c . <<<"$REMOTE_LIST" || true)"
+[ "$COUNT" -gt 0 ] || fail "rclone connected, but $SFTP_PATH on $SFTP_HOST is empty. Check the path; nothing was changed."
+
+# The same folder SSHFS shows? Compare top-level names while SSHFS is still up.
+if [ "$(fstype)" = fuse.sshfs ]; then
+  SSHFS_LIST="$(timeout 60 ls -1A "$MOUNTPOINT" 2>/dev/null || true)"
+  if [ -n "$SSHFS_LIST" ]; then
+    COMMON="$(comm -12 <(sort <<<"$SSHFS_LIST") <(sort <<<"$REMOTE_LIST") | grep -c . || true)"
+    [ "$COMMON" -gt 0 ] || fail "rclone sees $SFTP_PATH on $SFTP_HOST, but none of its folders match what SSHFS shows at $MOUNTPOINT. Check the path; nothing was changed."
+  fi
+fi
+OK_MSG="rclone can reach $SFTP_USER@$SFTP_HOST:$SFTP_PATH with $KEY ($COUNT items)."
+if [ "$MODE" = check ]; then
+  say "Test passed: $OK_MSG"
+  exit 0
+fi
+echo "$OK_MSG"
+
+# ---- Save the rclone settings ---------------------------------------------------
+[ "$KEY" -ef "$CONF_DIR/ssh_key" ] || install -m 600 -o "$RUN_USER" -g "$RUN_USER" "$KEY" "$CONF_DIR/ssh_key"
+write_conf "$RCLONE_CONF" "$CONF_DIR/ssh_key" "$CONF_DIR/known_hosts"
+set_env REMOTE "plexcache-sftp:$SFTP_PATH"
+set_env RCLONE_CONFIG "$RCLONE_CONF"
+set_env MOUNTPOINT "$MOUNTPOINT"
+[ -n "$KNOWN_HOSTS_SRC" ] || echo "Note: no known_hosts entry for $SFTP_HOST; rclone won't verify its host key." >&2
+if [ "$CONFIGURE_ONLY" -eq 1 ] || [ "$(fstype)" = fuse.rclone ]; then
+  say "Saved the rclone settings for $SFTP_USER@$SFTP_HOST:$SFTP_PATH."
+  exit 0
+fi
+
+# ---- Switch -----------------------------------------------------------------------
+WAS_SSHFS=0
+[ "$(fstype)" = fuse.sshfs ] && WAS_SSHFS=1
+trap 'rm -rf "$TMP"; systemctl start plexmediaserver 2>/dev/null || true' EXIT
+say "Switching $MOUNTPOINT to the cached mount (Plex pauses for a moment)..."
+systemctl stop plexmediaserver 2>/dev/null || true
+if [ -n "$(fstab_sshfs)" ]; then
+  cp /etc/fstab "/etc/fstab.plex-cache.$(date +%Y%m%d%H%M%S)"
+  sed -i -E "\\|^[^#]|{/sshfs/{\\|${AT}|s|^|${DISABLED}|}}" /etc/fstab
+  systemctl daemon-reload
+fi
+if [ "$WAS_SSHFS" -eq 1 ]; then
+  fusermount -uz "$MOUNTPOINT" 2>/dev/null || umount -l "$MOUNTPOINT"
+fi
+mkdir -p "$MOUNTPOINT"
+chown "$RUN_USER": "$MOUNTPOINT"
+
+# Up, and showing the same folders rclone listed a moment ago?
+mounted_ok() {
+  [ "$(fstype)" = fuse.rclone ] || return 1
+  local seen
+  seen="$(timeout 60 sudo -u "$RUN_USER" ls -1A "$MOUNTPOINT" 2>/dev/null | grep -c . || true)"
+  [ "$seen" -gt 0 ]
+}
+systemctl daemon-reload
+if systemctl enable --now plex-cache-mount && mounted_ok; then
+  say "Done: $MOUNTPOINT is now the cached rclone mount ($COUNT items). To undo: sudo plex-cache-switch --back"
+  exit 0
+fi
+
+# Put SSHFS back so Plex keeps its media.
+WHY="$(journalctl -u plex-cache-mount -n 5 --no-pager -o cat 2>/dev/null | grep -v '^\s*$' | tail -1 || true)"
+systemctl disable --now plex-cache-mount 2>/dev/null || true
+fusermount -uz "$MOUNTPOINT" 2>/dev/null || true
+if [ "$WAS_SSHFS" -eq 1 ] && sshfs_up && [ "$(fstype)" = fuse.sshfs ]; then
+  fail "The cached mount didn't come up with your files${WHY:+ ($WHY)}, so SSHFS was put back. See: journalctl -u plex-cache-mount"
+fi
+fail "The cached mount didn't come up${WHY:+ ($WHY)}. See: journalctl -u plex-cache-mount"
