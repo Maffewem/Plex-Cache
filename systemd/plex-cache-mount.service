@@ -1,0 +1,32 @@
+[Unit]
+Description=rclone mount of remote media with a local disk cache (plex-cache)
+Wants=network-online.target
+After=network-online.target
+Before=plexmediaserver.service
+
+[Service]
+Type=notify
+User=@USER@
+Group=@USER@
+EnvironmentFile=/etc/plex-precache/rclone-mount.env
+ExecStart=/usr/bin/rclone mount ${REMOTE} ${MOUNTPOINT} \
+  --config ${RCLONE_CONFIG} \
+  --allow-other \
+  --vfs-cache-mode full \
+  --cache-dir ${CACHE_DIR} \
+  --vfs-cache-max-size ${CACHE_MAX_SIZE} \
+  --vfs-cache-max-age ${CACHE_MAX_AGE} \
+  --vfs-cache-min-free-space ${CACHE_MIN_FREE} \
+  --vfs-read-ahead ${READ_AHEAD} \
+  --buffer-size ${BUFFER_SIZE} \
+  --vfs-read-chunk-size 64M \
+  --vfs-read-chunk-size-limit 2G \
+  --dir-cache-time 1h \
+  --umask 002 \
+  $EXTRA_ARGS
+ExecStop=/bin/sh -c 'fusermount -uz "$MOUNTPOINT" 2>/dev/null || fusermount3 -uz "$MOUNTPOINT"'
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

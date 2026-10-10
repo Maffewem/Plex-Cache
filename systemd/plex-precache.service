@@ -1,0 +1,14 @@
+[Unit]
+Description=Pre-cache what Plex is playing (and what's next) from remote storage
+After=network-online.target plexmediaserver.service plex-cache-mount.service
+Wants=network-online.target
+
+[Service]
+User=@USER@
+ExecStart=/usr/bin/python3 /opt/plex-precache/plex_precache.py -c /etc/plex-precache/config.ini
+Restart=on-failure
+RestartSec=15
+Nice=10
+
+[Install]
+WantedBy=multi-user.target
