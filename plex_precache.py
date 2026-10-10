@@ -12,9 +12,14 @@ Standard library only, so it runs on any Swizzin box with python3.
 from __future__ import annotations
 
 import argparse
+import collections
 import configparser
 import heapq
+import html
+import http.server
+import json
 import itertools
+import shutil
 import logging
 import os
 import signal
@@ -40,6 +45,11 @@ DEFAULTS = {
     "read_block_mb": "8",
     "remember_hours": "12",
     "seek_margin_mb": "64",
+    "cache_dir": "/var/cache/plex-cache",
+    "min_free_gb": "10",
+    "status_bind": "127.0.0.1",
+    "status_port": "8789",
+    "mount_env": "/etc/plex-precache/rclone-mount.env",
 }
 
 # Lower number runs first.
@@ -71,6 +81,11 @@ class Config:
         self.read_block = max(1, s.getint("read_block_mb")) * MB
         self.remember = s.getfloat("remember_hours") * 3600
         self.seek_margin = s.getint("seek_margin_mb") * MB
+        self.cache_dir = s.get("cache_dir")
+        self.min_free = int(s.getfloat("min_free_gb") * 1024 * MB)
+        self.status_bind = s.get("status_bind")
+        self.status_port = s.getint("status_port")
+        self.mount_env = s.get("mount_env")
         # Longest prefix first so nested mappings win.
         self.path_map = sorted(cp["path_map"].items(), key=lambda kv: -len(kv[0]))
 
@@ -171,6 +186,9 @@ class Job:
         self.pos = start
         self.end = end  # None means read to EOF
         self.prio = prio
+        self.start = start
+        self.size = _size_or_zero(path)
+        self.started_at: float | None = None
         self.lock = threading.Lock()
 
     def jump_to(self, offset: int) -> None:
@@ -216,6 +234,11 @@ class Prefetcher:
         self.counter = itertools.count()
         self.active: dict[str, Job] = {}  # queued or running, by local path
         self.done: dict[str, float] = {}  # path -> time finished
+        # For the status page.
+        self.recent: collections.deque = collections.deque(maxlen=25)
+        self.sessions: list[dict] = []
+        self.last_poll: tuple[float, str | None] = (0.0, None)
+        self.warned: set[str] = set()
 
     def submit(self, path: str, start: int = 0, end: int | None = None,
                prio: int = PRIO_PLAYING) -> None:
@@ -228,13 +251,34 @@ class Prefetcher:
             if finished and time.time() - finished < self.cfg.remember:
                 return
             if not os.path.isfile(path):
-                log.warning("not found locally (check [path_map]): %s", path)
+                if path not in self.warned:
+                    self.warned.add(path)
+                    log.warning("not found locally (check [path_map]): %s", path)
+                return
+            if prio != PRIO_PLAYING and not self.has_room(path, start, end):
                 return
             job = Job(path, start, end, prio)
             self.active[path] = job
             heapq.heappush(self.queue, (prio, next(self.counter), job))
             self.cv.notify()
             log.info("queued %s from %d MB (prio %d)", path, start // MB, prio)
+
+    def has_room(self, path: str, start: int, end: int | None) -> bool:
+        """Whether caching this file would leave `min_free_gb` on the cache disk.
+
+        Only applied to speculative reads (next episodes, On Deck); the file
+        that is playing is always read, as Plex will pull it into cache anyway.
+        """
+        if not self.cfg.cache_dir or not os.path.isdir(self.cfg.cache_dir):
+            return True
+        size = _size_or_zero(path)
+        need = max(0, (size if end is None else min(end, size)) - start)
+        free = shutil.disk_usage(self.cfg.cache_dir).free
+        if free - need < self.cfg.min_free:
+            log.info("skipping %s: %d MB would leave less than %d MB free in %s",
+                     path, need // MB, self.cfg.min_free // MB, self.cfg.cache_dir)
+            return False
+        return True
 
     def worker(self) -> None:
         while not self.stop.is_set():
@@ -244,13 +288,15 @@ class Prefetcher:
                 if self.stop.is_set():
                     return
                 _, _, job = heapq.heappop(self.queue)
-            started = time.time()
+            started = job.started_at = time.time()
             ok = False
             try:
                 n = read_through(job, self.cfg.read_block, self.stop)
                 secs = max(time.time() - started, 0.001)
                 log.info("cached %s: %d MB in %.0fs (%.1f MB/s)",
                          job.path, n // MB, secs, n / MB / secs)
+                self.recent.appendleft({"path": job.path, "mb": n // MB,
+                                        "secs": round(secs), "at": time.time()})
                 ok = True
             except OSError as e:
                 log.warning("read failed for %s: %s", job.path, e)
@@ -267,6 +313,29 @@ class Prefetcher:
             for path in [p for p, t in self.done.items() if t < cutoff]:
                 del self.done[path]
 
+    def snapshot(self) -> dict:
+        """State for the status page."""
+        with self.cv:
+            jobs = list(self.active.values())
+        rows = []
+        for job in sorted(jobs, key=lambda j: (j.started_at is None, j.prio)):
+            with job.lock:
+                pos, end = job.pos, job.end
+            last = min(end, job.size) if end is not None and job.size else (end or job.size)
+            span = max(1, (last or 0) - job.start)
+            rows.append({
+                "path": job.path,
+                "kind": {PRIO_PLAYING: "playing", PRIO_NEXT: "next episode",
+                         PRIO_ON_DECK: "on deck"}.get(job.prio, str(job.prio)),
+                "state": "reading" if job.started_at else "queued",
+                "percent": round(100 * min(1.0, max(0, pos - job.start) / span)),
+                "mb_s": (round((pos - job.start) / MB / max(1, time.time() - job.started_at), 1)
+                         if job.started_at else None),
+            })
+        polled, err = self.last_poll
+        return {"jobs": rows, "recent": list(self.recent), "sessions": self.sessions,
+                "last_poll": polled, "poll_error": err}
+
     def shutdown(self, *_args) -> None:
         self.stop.set()
         with self.cv:
@@ -274,7 +343,10 @@ class Prefetcher:
 
 
 def poll_once(plex: Plex, cfg: Config, pf: Prefetcher) -> None:
-    for s in parse_sessions(plex.get("/status/sessions")):
+    sessions = parse_sessions(plex.get("/status/sessions"))
+    pf.sessions = [{"title": s["title"], "state": s["state"], "file": s["file"]}
+                   for s in sessions]
+    for s in sessions:
         path = cfg.local_path(s["file"])
         size = s["size"] or _size_or_zero(path)
         start = max(0, byte_offset(s["view_offset"], s["duration"], size) - cfg.seek_margin)
@@ -313,17 +385,154 @@ def run_daemon(cfg: Config) -> None:
     threads = [threading.Thread(target=pf.worker, daemon=True) for _ in range(cfg.workers)]
     for t in threads:
         t.start()
+    if cfg.status_port:
+        start_status_server(cfg, pf)
     log.info("watching %s every %.0fs with %d workers",
              cfg.plex_url, cfg.poll_interval, cfg.workers)
     while not pf.stop.is_set():
         try:
             poll_once(plex, cfg, pf)
+            pf.last_poll = (time.time(), None)
         except (OSError, ET.ParseError) as e:
             log.warning("poll failed: %s", e)
+            pf.last_poll = (time.time(), str(e))
         pf.forget_expired()
         pf.stop.wait(cfg.poll_interval)
     for t in threads:
         t.join(timeout=5)
+
+
+# --------------------------------------------------------------------------
+# Status page (proxied by nginx at /plexcache/ on Swizzin)
+
+
+def read_env_file(path: str) -> dict:
+    out = {}
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    out[k.strip()] = v.strip().strip('"')
+    except OSError:
+        pass
+    return out
+
+
+_usage_cache: dict = {}
+
+
+def dir_usage(path: str, max_age: float = 30) -> int | None:
+    """Bytes actually stored under `path` (rclone cache files are sparse)."""
+    hit = _usage_cache.get(path)
+    if hit and time.time() - hit[0] < max_age:
+        return hit[1]
+    if not os.path.isdir(path):
+        return None
+    total = 0
+    for dirpath, _dirs, files in os.walk(path):
+        for name in files:
+            try:
+                total += os.lstat(os.path.join(dirpath, name)).st_blocks * 512
+            except OSError:
+                pass
+    _usage_cache[path] = (time.time(), total)
+    return total
+
+
+def status_data(cfg: Config, pf: Prefetcher) -> dict:
+    data = pf.snapshot()
+    disk = None
+    if cfg.cache_dir and os.path.isdir(cfg.cache_dir):
+        du = shutil.disk_usage(cfg.cache_dir)
+        disk = {"total": du.total, "free": du.free}
+    env = read_env_file(cfg.mount_env)
+    data["cache"] = {
+        "dir": cfg.cache_dir,
+        "used": dir_usage(cfg.cache_dir) if cfg.cache_dir else None,
+        "disk": disk,
+        "min_free_gb": cfg.min_free / 1024 / MB,
+        "mount": {k: env.get(k) for k in ("REMOTE", "MOUNTPOINT", "CACHE_MAX_SIZE",
+                                          "CACHE_MIN_FREE", "CACHE_MAX_AGE",
+                                          "READ_AHEAD", "BUFFER_SIZE")},
+    }
+    return data
+
+
+def _gb(n: int | None) -> str:
+    return "?" if n is None else f"{n / 1024 / MB:.1f} GB"
+
+
+def render_status(d: dict) -> str:
+    e = html.escape
+    c = d["cache"]
+    m = c["mount"]
+    rows = "".join(
+        f"<tr><td>{e(os.path.basename(j['path']))}</td><td>{e(j['kind'])}</td>"
+        f"<td>{e(j['state'])}</td><td><progress max=100 value={j['percent']}></progress> "
+        f"{j['percent']}%</td><td>{'' if j['mb_s'] is None else j['mb_s']}</td></tr>"
+        for j in d["jobs"]) or "<tr><td colspan=5>Nothing being cached right now</td></tr>"
+    recent = "".join(
+        f"<tr><td>{e(os.path.basename(r['path']))}</td><td>{r['mb']} MB</td>"
+        f"<td>{r['secs']}s</td><td>{time.strftime('%H:%M', time.localtime(r['at']))}</td></tr>"
+        for r in d["recent"]) or "<tr><td colspan=4>None yet</td></tr>"
+    sessions = "".join(
+        f"<li>{e(s['title'] or '?')} ({e(s['state'] or 'unknown')})</li>"
+        for s in d["sessions"]) or "<li>Nothing playing</li>"
+    poll = ("never" if not d["last_poll"] else
+            time.strftime("%H:%M:%S", time.localtime(d["last_poll"])))
+    err = f"<p class=err>Last Plex poll failed: {e(d['poll_error'])}</p>" if d["poll_error"] else ""
+    disk = c["disk"] or {}
+    limits = " · ".join(f"{k.replace('_', ' ').lower()}: {e(v)}" for k, v in m.items() if v)
+    return f"""<!doctype html><html><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<meta http-equiv=refresh content=10><title>Plex-Cache</title><style>
+:root{{color-scheme:light dark;--bg:#fff;--fg:#1c1c1c;--muted:#666;--line:#ddd}}
+@media (prefers-color-scheme:dark){{:root{{--bg:#16181d;--fg:#e6e6e6;--muted:#9a9a9a;--line:#333}}}}
+body{{background:var(--bg);color:var(--fg);font:15px system-ui,sans-serif;margin:0 auto;
+max-width:900px;padding:16px}}h1{{font-size:22px}}h2{{font-size:16px;margin-top:28px}}
+table{{width:100%;border-collapse:collapse}}td,th{{text-align:left;padding:6px 8px;
+border-bottom:1px solid var(--line);overflow-wrap:anywhere}}.muted{{color:var(--muted)}}
+.err{{color:#d33}}.stats{{display:flex;gap:24px;flex-wrap:wrap}}.stats b{{display:block;
+font-size:20px}}</style></head><body>
+<h1>Plex-Cache</h1>{err}
+<div class=stats><div><b>{_gb(c['used'])}</b><span class=muted>cached
+{('of ' + e(m['CACHE_MAX_SIZE'])) if m.get('CACHE_MAX_SIZE') else ''}</span></div>
+<div><b>{_gb(disk.get('free'))}</b><span class=muted>free on cache disk</span></div>
+<div><b>{len(d['sessions'])}</b><span class=muted>playing in Plex</span></div></div>
+<p class=muted>{limits or 'Mount settings not readable'} · last checked Plex {poll}</p>
+<h2>Playing</h2><ul>{sessions}</ul>
+<h2>Caching now</h2><table><tr><th>File</th><th>Why</th><th>State</th><th>Progress</th>
+<th>MB/s</th></tr>{rows}</table>
+<h2>Recently cached</h2><table><tr><th>File</th><th>Read</th><th>Took</th><th>At</th></tr>
+{recent}</table></body></html>"""
+
+
+def start_status_server(cfg: Config, pf: Prefetcher) -> None:
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            data = status_data(cfg, pf)
+            if self.path.rstrip("/").endswith("/api/status"):
+                body, ctype = json.dumps(data).encode(), "application/json"
+            else:
+                body, ctype = render_status(data).encode(), "text/html; charset=utf-8"
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_args):
+            pass
+
+    try:
+        srv = http.server.ThreadingHTTPServer((cfg.status_bind, cfg.status_port), Handler)
+    except OSError as e:
+        log.warning("status page disabled: %s", e)
+        return
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    log.info("status page on http://%s:%d/", cfg.status_bind, cfg.status_port)
 
 
 def warm(cfg: Config, paths: list[str]) -> None:

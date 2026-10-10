@@ -93,6 +93,43 @@ class ReadTests(unittest.TestCase):
         pf.submit(os.path.join(self.tmp.name, "missing.mkv"))
         self.assertEqual(len(pf.queue), 1)
 
+    def test_speculative_reads_respect_min_free(self):
+        cfg = pp.Config(None)
+        cfg.cache_dir = self.tmp.name
+        free = pp.shutil.disk_usage(self.tmp.name).free
+        cfg.min_free = free  # any read would dip below the floor
+        pf = pp.Prefetcher(cfg)
+        pf.submit(self.path, prio=pp.PRIO_NEXT)
+        self.assertEqual(len(pf.queue), 0)
+        pf.submit(self.path, prio=pp.PRIO_PLAYING)  # playing file is never skipped
+        self.assertEqual(len(pf.queue), 1)
+        cfg.min_free = 0
+        self.assertTrue(pf.has_room(self.path, 0, None))
+
+
+class StatusTests(unittest.TestCase):
+    def test_status_page_renders_and_escapes(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = pp.Config(None)
+            cfg.cache_dir = d
+            cfg.mount_env = os.path.join(d, "env")
+            with open(cfg.mount_env, "w") as f:
+                f.write("CACHE_MAX_SIZE=16G\n# comment\nREMOTE=box:media\n")
+            path = os.path.join(d, "<i>ep.mkv")
+            with open(path, "wb") as f:
+                f.write(b"x" * 1000)
+            pf = pp.Prefetcher(cfg)
+            pf.submit(path, start=500, prio=pp.PRIO_NEXT)
+            pf.sessions = [{"title": "Show & Co", "state": "playing", "file": path}]
+            data = pp.status_data(cfg, pf)
+            self.assertEqual(data["cache"]["mount"]["CACHE_MAX_SIZE"], "16G")
+            self.assertEqual(data["jobs"][0]["kind"], "next episode")
+            self.assertEqual(data["jobs"][0]["state"], "queued")
+            page = pp.render_status(data)
+            self.assertIn("&lt;i&gt;ep.mkv", page)
+            self.assertIn("Show &amp; Co", page)
+            self.assertIn("of 16G", page)
+
 
 if __name__ == "__main__":
     unittest.main()
