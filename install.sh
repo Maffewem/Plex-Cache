@@ -15,27 +15,30 @@
 # (backup kept) and starts the cached mount in its place, so Plex paths don't change.
 #
 # Re-running is safe and keeps your config. Change the size later with plex-cache-resize.
+# Later versions install with: sudo plex-cache-update (or the status page's Update button).
 set -euo pipefail
 
 cd "$(dirname "$0")"
 WITH_MOUNT=0
 RUN_USER=""
-CACHE_SIZE=""
-CACHE_PERCENT=""
-MIN_FREE=""
-SFTP="" SSH_KEY="" SSH_PORT=22 MOUNT_AT="" REPLACE_SSHFS=0
+OPT_CACHE_SIZE=""
+OPT_CACHE_PERCENT=""
+OPT_MIN_FREE=""
+SFTP="" SSH_KEY="" SSH_PORT=22 MOUNT_AT="" REPLACE_SSHFS=0 UPDATE=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --with-mount) WITH_MOUNT=1 ;;
     --user) RUN_USER="$2"; shift ;;
-    --cache-size) CACHE_SIZE="$2"; shift ;;
-    --cache-percent) CACHE_PERCENT="$2"; shift ;;
-    --min-free) MIN_FREE="$2"; shift ;;
+    --cache-size) OPT_CACHE_SIZE="$2"; shift ;;
+    --cache-percent) OPT_CACHE_PERCENT="$2"; shift ;;
+    --min-free) OPT_MIN_FREE="$2"; shift ;;
     --sftp) SFTP="$2"; WITH_MOUNT=1; shift ;;
     --ssh-key) SSH_KEY="$2"; shift ;;
     --ssh-port) SSH_PORT="$2"; shift ;;
     --mountpoint) MOUNT_AT="$2"; shift ;;
     --replace-sshfs) REPLACE_SSHFS=1 ;;
+    # Used by plex-cache-update: refresh the installed files, keep every setting.
+    --update) UPDATE=1 ;;
     -h|--help) sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 1 ;;
   esac
@@ -43,6 +46,11 @@ while [ $# -gt 0 ]; do
 done
 
 [ "$(id -u)" -eq 0 ] || { echo "run as root (sudo)" >&2; exit 1; }
+if [ "$UPDATE" -eq 1 ]; then
+  [ -f /etc/systemd/system/plex-cache-mount.service ] && WITH_MOUNT=1
+  # Keep running as whoever the services already run as.
+  RUN_USER="$(sed -n 's/^User=//p' /etc/systemd/system/plex-precache.service 2>/dev/null)"
+fi
 if [ -n "$SFTP" ]; then
   case "$SFTP" in *@*:/*) ;; *) echo "--sftp must look like user@host:/path" >&2; exit 1 ;; esac
   [ -n "$SSH_KEY" ] && [ -f "$SSH_KEY" ] || { echo "--sftp needs --ssh-key pointing at the key SSHFS uses" >&2; exit 1; }
@@ -65,8 +73,17 @@ echo "Running services as: $RUN_USER"
 install -d -m 755 /opt/plex-precache /etc/plex-precache
 install -m 755 plex_precache.py uninstall.sh /opt/plex-precache/
 install -m 755 plex-cache-resize /usr/local/bin/plex-cache-resize
+install -m 755 plex-cache-update /usr/local/sbin/plex-cache-update
+for unit in plex-cache-update.service plex-cache-autoupdate.service plex-cache-autoupdate.timer; do
+  install -m 644 "systemd/$unit" "/etc/systemd/system/$unit"
+done
+if git -C . rev-parse --git-dir >/dev/null 2>&1; then
+  git -C . rev-parse --short=7 HEAD > /opt/plex-precache/VERSION
+fi
 
+NEW_CONFIG=0
 if [ ! -f /etc/plex-precache/config.ini ]; then
+  NEW_CONFIG=1
   install -m 640 -o "$RUN_USER" -g "$RUN_USER" config.example.ini /etc/plex-precache/config.ini
   PREFS="/var/lib/plexmediaserver/Library/Application Support/Plex Media Server/Preferences.xml"
   if [ -f "$PREFS" ]; then
@@ -150,15 +167,26 @@ RCONF
   grep -q '^user_allow_other' /etc/fuse.conf 2>/dev/null || echo user_allow_other >> /etc/fuse.conf
   sed "s/@USER@/$RUN_USER/g" systemd/plex-cache-mount.service > /etc/systemd/system/plex-cache-mount.service
 
-  # Size the cache: explicit flags win; a fresh install defaults to 60% of free disk.
+  # A fresh install is tuned to this server's disk, RAM and CPU; explicit flags win.
+  if [ "$NEW_ENV" -eq 1 ]; then
+    echo "Tuned for this server:"
+    while IFS='=' read -r k v; do
+      case "$k" in
+        CACHE_*|READ_AHEAD|BUFFER_SIZE) set_env "$k" "$v"; echo "  $k=$v" ;;
+        next_episodes|workers|min_free_gb)
+          if [ "$NEW_CONFIG" -eq 1 ]; then
+            sed -i "s|^$k *=.*|$k = $v|" /etc/plex-precache/config.ini
+            echo "  $k = $v"
+          fi ;;
+      esac
+    done < <(python3 /opt/plex-precache/plex_precache.py --recommend "$CACHE_DIR")
+  fi
   RESIZE=()
-  [ -n "$MIN_FREE" ] && RESIZE+=(--min-free "$MIN_FREE")
-  if [ -n "$CACHE_SIZE" ]; then
-    RESIZE+=("$CACHE_SIZE")
-  elif [ -n "$CACHE_PERCENT" ]; then
-    RESIZE+=(--percent "$CACHE_PERCENT")
-  elif [ "$NEW_ENV" -eq 1 ]; then
-    RESIZE+=(--percent 60)
+  [ -n "$OPT_MIN_FREE" ] && RESIZE+=(--min-free "$OPT_MIN_FREE")
+  if [ -n "$OPT_CACHE_SIZE" ]; then
+    RESIZE+=("$OPT_CACHE_SIZE")
+  elif [ -n "$OPT_CACHE_PERCENT" ]; then
+    RESIZE+=(--percent "$OPT_CACHE_PERCENT")
   fi
   if [ ${#RESIZE[@]} -gt 0 ]; then
     PLEX_CACHE_ENV=/etc/plex-precache/rclone-mount.env /usr/local/bin/plex-cache-resize --no-restart "${RESIZE[@]}"
@@ -249,10 +277,12 @@ chmod 640 /etc/plex-precache/config.ini
 SUDOERS=/etc/sudoers.d/plex-cache
 {
   echo "# Lets the Plex-Cache status page apply settings. Added by Plex-Cache install.sh."
-  for unit in plex-cache-mount plex-precache; do
-    for bin in /usr/bin/systemctl /bin/systemctl; do
+  for bin in /usr/bin/systemctl /bin/systemctl; do
+    for unit in plex-cache-mount plex-precache; do
       echo "$RUN_USER ALL=(root) NOPASSWD: $bin restart $unit"
     done
+    # The Update button; the service runs the root-owned plex-cache-update.
+    echo "$RUN_USER ALL=(root) NOPASSWD: $bin start --no-block plex-cache-update"
   done
 } > "$SUDOERS.tmp"
 chmod 440 "$SUDOERS.tmp"
@@ -270,6 +300,9 @@ if [ -d /etc/swizzin/scripts/remove ]; then
 fi
 
 systemctl daemon-reload
+# The timer runs nightly but only updates when auto_update = true.
+systemctl enable --now plex-cache-autoupdate.timer >/dev/null 2>&1 || true
+[ "$UPDATE" -eq 1 ] && { echo "Updated Plex-Cache files."; exit 0; }
 echo
 echo "Installed. Next:"
 [ "$WITH_MOUNT" -eq 1 ] && [ "$REPLACE_SSHFS" -eq 0 ] && echo "  systemctl enable --now plex-cache-mount   # after editing rclone-mount.env"

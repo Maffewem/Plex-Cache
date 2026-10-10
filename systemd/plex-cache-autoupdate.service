@@ -1,0 +1,8 @@
+[Unit]
+Description=Update Plex-Cache from GitHub if auto_update is on
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/plex-cache-update --auto

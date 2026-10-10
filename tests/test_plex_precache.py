@@ -235,7 +235,7 @@ class SettingsTests(unittest.TestCase):
     def test_validation_rejects_bad_and_injected_values(self):
         good = {"next_episodes": "2", "next_episode_head_mb": "0", "on_deck_limit": "5",
                 "on_deck_head_mb": "512", "workers": "2", "poll_interval": "10",
-                "remember_hours": "12"}
+                "remember_hours": "12", "stop_after_minutes": "10"}
         self.assertEqual(pp.validate_prefetch(good)["on_deck"], "false")
         with self.assertRaises(pp.SettingsError):
             pp.validate_prefetch(dict(good, workers="0"))
@@ -317,6 +317,77 @@ class MountTests(unittest.TestCase):
                   cache={"mount": {}})
         titles = [c["title"] for c in pp.system_checks(d2)]
         self.assertIn("Media mount", titles)
+
+
+class StopAbandonedTests(unittest.TestCase):
+    def test_closed_stream_stops_its_downloads_but_paused_keeps_them(self):
+        with tempfile.TemporaryDirectory() as d:
+            files = {}
+            for name in ("ep1", "ep2", "film", "manual"):
+                files[name] = os.path.join(d, name)
+                with open(files[name], "wb") as f:
+                    f.write(b"x" * 100)
+            cfg = pp.Config(None)
+            cfg.stop_after = 600
+            pf = pp.Prefetcher(cfg)
+            pf.submit(files["ep1"], owner=files["ep1"])
+            pf.submit(files["ep2"], prio=pp.PRIO_NEXT, owner=files["ep1"])
+            pf.submit(files["film"], owner=files["film"])
+            pf.submit(files["manual"], prio=pp.PRIO_MANUAL)
+            now = pp.time.time()
+            pf.last_seen = {files["ep1"]: now - 700, files["film"]: now - 60}
+            pf.stop_abandoned()
+            self.assertEqual(sorted(os.path.basename(p) for p in pf.active),
+                             ["film", "manual"])
+            self.assertTrue(all(j.cancelled for _, _, j in pf.queue
+                                if j.owner == files["ep1"]))
+            # A cancelled read stops at once and isn't remembered as cached.
+            job = pp.Job(files["ep1"], 0, None, 0)
+            job.cancelled = True
+            self.assertEqual(pp.read_through(job, 10, threading.Event()), 0)
+            self.assertNotIn(files["ep1"], pf.done)
+            cfg.stop_after = 0  # 0 = never stop
+            pf.last_seen[files["film"]] = now - 99999
+            pf.stop_abandoned()
+            self.assertIn(files["film"], pf.active)
+
+
+class RecommendTests(unittest.TestCase):
+    def test_small_box(self):
+        gb = 1024 ** 3
+        rec = pp.recommend_settings("/", mem=int(7.75 * gb), cpus=4,
+                                    disk=(int(67.66 * gb), int(38.12 * gb)), cached=0)
+        self.assertEqual(rec["mount"], {"CACHE_PERCENT": "60", "CACHE_MAX_SIZE": "18G",
+                                        "CACHE_MIN_FREE": "7G", "CACHE_MAX_AGE": "72h",
+                                        "READ_AHEAD": "1G", "BUFFER_SIZE": "128M"})
+        self.assertEqual(rec["prefetch"], {"next_episodes": "1", "workers": "2",
+                                           "min_free_gb": "7"})
+
+    def test_big_and_tiny_boxes_stay_in_bounds(self):
+        gb = 1024 ** 3
+        big = pp.recommend_settings("/", mem=64 * gb, cpus=16, disk=(4000 * gb, 3000 * gb),
+                                    cached=0)["mount"]
+        self.assertEqual((big["CACHE_MIN_FREE"], big["BUFFER_SIZE"], big["READ_AHEAD"],
+                          big["CACHE_MAX_AGE"]), ("20G", "512M", "4G", "14d"))
+        tiny = pp.recommend_settings("/", mem=1 * gb, cpus=1, disk=(10 * gb, 3 * gb),
+                                     cached=0)
+        self.assertEqual(tiny["mount"]["CACHE_MAX_SIZE"], "5G")
+        self.assertEqual(tiny["mount"]["BUFFER_SIZE"], "32M")
+        self.assertEqual(tiny["prefetch"]["workers"], "1")
+
+    def test_settings_page_has_recommendations_and_updates(self):
+        with tempfile.TemporaryDirectory() as d:
+            ini = os.path.join(d, "config.ini")
+            with open(ini, "w") as f:
+                f.write("[plex]\nworkers = 2\n")
+            cfg = pp.Config(ini)
+            cfg.cache_dir, cfg.mount_env = d, os.path.join(d, "missing.env")
+            page = pp.render_settings(cfg, "tok", None, True)
+            self.assertIn("Use recommended settings", page)
+            self.assertIn("Recommended for this server", page)
+            self.assertIn("action=update/run", page)
+            self.assertIn("Automatic updates on", pp.set_auto_update(cfg, {"auto_update": "on"}))
+            self.assertTrue(pp.Config(ini).auto_update)
 
 
 if __name__ == "__main__":
