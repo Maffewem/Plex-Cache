@@ -539,9 +539,15 @@ class RcloneSettingsTests(unittest.TestCase):
             page = pp.render_settings(self.cfg, "t", None, True)
         self.assertIn("action=switch/run", page)
         self.assertIn("Last switch: 2026-10-10 11:00 Test passed", page)
+        # On the cached mount there's nothing to do here; going back is CLI-only.
         with mock.patch.object(pp, "media_mount", lambda cfg: {
                 "where": self.mnt, "fstype": "fuse.rclone", "undo": True, "note": ""}):
-            self.assertIn("action=switch/back", pp.render_settings(self.cfg, "t", None, True))
+            page = pp.render_settings(self.cfg, "t", None, True)
+        self.assertNotIn("id=s-switch", page)
+        self.assertNotIn("switch/back", page)
+        with mock.patch.object(pp, "media_mount", lambda cfg: {
+                "where": self.mnt, "fstype": "", "undo": True, "note": ""}):
+            self.assertIn("isn't running", pp.render_settings(self.cfg, "t", None, True))
 
     def test_failed_restart_puts_old_files_back(self):
         with open(self.env) as f:

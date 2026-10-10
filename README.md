@@ -87,8 +87,7 @@ line out of `/etc/fstab` (keeping a dated backup), stops Plex, unmounts SSHFS
 and starts the cached mount at the same place. If the cached mount doesn't come
 up showing your files, SSHFS is put back. Plex is always started again.
 
-To go back: **Go back to SSHFS** on the status page, or
-`sudo plex-cache-switch --back`. `box remove plexcache` also does this first.
+To go back: `sudo plex-cache-switch --back`. `box remove plexcache` also does this first.
 
 If SSHFS is mounted by a script or service rather than fstab, disable that
 too, or it will try to mount over the new mount at boot.

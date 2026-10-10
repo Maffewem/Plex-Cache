@@ -1691,19 +1691,17 @@ def switch_check() -> str:
     return lines[-1] if lines else "Test passed."
 
 
-def start_switch(back: bool) -> str:
-    unit = "plex-cache-switch-back" if back else "plex-cache-switch"
+def start_switch() -> str:
     try:
-        ok = subprocess.run(["sudo", "-n", "systemctl", "start", "--no-block", unit],
+        ok = subprocess.run(["sudo", "-n", "systemctl", "start", "--no-block", "plex-cache-switch"],
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                             timeout=30).returncode == 0
     except (OSError, subprocess.TimeoutExpired):
         ok = False
     if not ok:
-        raise SettingsError("Couldn't start it from here. Run: sudo plex-cache-switch"
-                            + (" --back" if back else ""))
-    return ("Going back to SSHFS" if back else "Switching to the cached mount") + \
-        (". Plex pauses for a moment. Reload this page in a minute to see how it went.")
+        raise SettingsError("Couldn't start it from here. Run: sudo plex-cache-switch")
+    return ("Switching to the cached mount. Plex pauses for a moment. Reload this page in a "
+            "minute to see how it went.")
 
 
 def set_auto_update(cfg: Config, form: dict) -> str:
@@ -1829,16 +1827,13 @@ the new mount doesn't show your files, SSHFS is put back.</p>
 <form method=post action=switch/check class=inline>{hidden}<button>Test first</button></form>
 <form method=post action=switch/run class=inline>{hidden}<button>Switch now</button></form>
 {note_html}</div>"""
-    elif mm and mm["undo"]:
+    elif mm and mm["undo"] and mm["fstype"] != "fuse.rclone":
+        # Only worth a panel when something is wrong; going back to SSHFS is
+        # left to the command line (sudo plex-cache-switch --back).
         switch_form = f"""
-<div class=panel id=s-switch><h3>Media mount</h3>
-<p>{e(mm["where"])} {"is the cached rclone mount." if mm["fstype"] == "fuse.rclone" else
-  "should be the cached rclone mount, but it isn't running, so Plex sees no media. Check "
-  "<code>journalctl -u plex-cache-mount</code>, or go back to SSHFS."}</p>
-<form method=post action=switch/back>{hidden}
-<button>Go back to SSHFS</button>
-<span class=muted>Plex pauses for a moment, and pre-caching stops until you switch again.</span>
-</form>{note_html}</div>"""
+<div class='panel badbox' id=s-switch><h3>Media mount</h3>
+<p>{e(mm["where"])} should be the cached rclone mount, but it isn't running, so Plex sees no
+media. Check <code>journalctl -u plex-cache-mount</code>.</p>{note_html}</div>"""
     warm_form = f"""
 <form method=post action=warm class=panel id=s-warm>{hidden}<h3>Pre-cache now</h3>
 {row("Folder or file", "<input name=path placeholder='TV/Some Show/Season 1' autocomplete=off>",
@@ -1912,7 +1907,7 @@ cursor:pointer;margin:0!important;padding:0}.notice.good{background:var(--good)}
 PANEL_FOR_ACTION = {
     "settings/prefetch": "s-prefetch", "settings/mount": "s-mount", "restart-mount": "s-mount",
     "settings/connection": "s-conn", "settings/recommended": "s-rec", "warm": "s-warm",
-    "switch/check": "s-switch", "switch/run": "s-switch", "switch/back": "s-switch",
+    "switch/check": "s-switch", "switch/run": "s-switch",
     "update/check": "s-update", "update/run": "s-update", "update/auto": "s-update",
 }
 
@@ -1966,9 +1961,7 @@ def start_status_server(cfg: Config, pf: Prefetcher) -> None:
                 elif action == ["switch", "check"]:
                     text = switch_check()
                 elif action == ["switch", "run"]:
-                    text = start_switch(back=False)
-                elif action == ["switch", "back"]:
-                    text = start_switch(back=True)
+                    text = start_switch()
                 elif action == ["update", "check"]:
                     text = check_for_update()
                 elif action == ["update", "run"]:
