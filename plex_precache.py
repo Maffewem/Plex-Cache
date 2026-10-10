@@ -56,6 +56,7 @@ DEFAULTS = {
     "mount_env": "/etc/plex-precache/rclone-mount.env",
     "require_cache_mount": "true",
     "auto_update": "false",
+    "stop_after_minutes": "10",
 }
 
 # Lower number runs first.
@@ -96,6 +97,7 @@ class Config:
         self.mount_env = s.get("mount_env")
         self.require_cache_mount = s.getboolean("require_cache_mount")
         self.auto_update = s.getboolean("auto_update")
+        self.stop_after = s.getfloat("stop_after_minutes") * 60
         # Longest prefix first so nested mappings win.
         self.path_map = sorted(cp["path_map"].items(), key=lambda kv: -len(kv[0]))
 
@@ -191,8 +193,14 @@ def byte_offset(view_offset_ms: int, duration_ms: int, size: int) -> int:
 
 
 class Job:
-    def __init__(self, path: str, start: int, end: int | None, prio: int):
+    def __init__(self, path: str, start: int, end: int | None, prio: int,
+                 owner: str | None = None):
         self.path = path
+        # The file being watched that this download is for (itself, or the
+        # episode before it). None for downloads nobody is watching for.
+        self.owner = owner
+        self.created = time.time()
+        self.cancelled = False
         self.pos = start
         self.end = end  # None means read to EOF
         self.prio = prio
@@ -217,7 +225,7 @@ def read_through(job: Job, block: int, stop: threading.Event) -> int:
     """
     total = 0
     with open(job.path, "rb", buffering=0) as f:
-        while not stop.is_set():
+        while not stop.is_set() and not job.cancelled:
             with job.lock:
                 pos = job.pos
                 end = job.end
@@ -255,10 +263,11 @@ class Prefetcher:
         self.warned: set[str] = set()
         self.n_workers = 0
         self.last_poll_secs = 0.0
+        self.last_seen: dict[str, float] = {}  # playing file -> last time Plex listed it
         self.blocked: dict[str, str] = {}  # mountpoint -> fstype we won't prefetch on
 
     def submit(self, path: str, start: int = 0, end: int | None = None,
-               prio: int = PRIO_PLAYING) -> None:
+               prio: int = PRIO_PLAYING, owner: str | None = None) -> None:
         with self.cv:
             job = self.active.get(path)
             if job is not None:
@@ -279,7 +288,7 @@ class Prefetcher:
             return
         if prio != PRIO_PLAYING and not self.has_room(path, start, end):
             return
-        job = Job(path, start, end, prio)
+        job = Job(path, start, end, prio, owner)
         with self.cv:
             if path in self.active:
                 self.active[path].jump_to(start)
@@ -346,10 +355,14 @@ class Prefetcher:
                 if self.stop.is_set():
                     return
                 _, _, job = heapq.heappop(self.queue)
+            if job.cancelled:
+                continue
             started = job.started_at = time.time()
             ok = False
             try:
                 n = read_through(job, self.cfg.read_block, self.stop)
+                if job.cancelled:
+                    continue  # finally still runs; not marked done, so it resumes if replayed
                 secs = max(time.time() - started, 0.001)
                 log.info("cached %s: %d MB in %.0fs (%.1f MB/s)",
                          job.path, n // MB, secs, n / MB / secs)
@@ -360,10 +373,40 @@ class Prefetcher:
                 log.warning("read failed for %s: %s", job.path, e)
             finally:
                 with self.cv:
-                    self.active.pop(job.path, None)
+                    if self.active.get(job.path) is job:
+                        del self.active[job.path]
                     # Failed reads are retried on the next poll.
                     if ok and not self.stop.is_set():
                         self.done[job.path] = time.time()
+
+    def saw_playing(self, paths: list[str]) -> None:
+        now = time.time()
+        for p in paths:
+            self.last_seen[p] = now
+
+    def stop_abandoned(self) -> None:
+        """Stop downloading for streams nobody has had open for stop_after_minutes.
+
+        A paused stream still shows in Plex, so it keeps its downloads; this only
+        catches viewers who closed the player.
+        """
+        if self.cfg.stop_after <= 0:
+            return
+        now = time.time()
+        with self.cv:
+            jobs = [j for j in self.active.values() if j.owner and not j.cancelled]
+            for job in jobs:
+                seen = self.last_seen.get(job.owner, job.created)
+                if now - seen >= self.cfg.stop_after:
+                    job.cancelled = True
+                    del self.active[job.path]
+                    log.info("stopped caching %s: nothing has played it for %.0f min",
+                             job.path, (now - seen) / 60)
+                    self.recent.appendleft({"path": job.path, "mb": 0, "secs": 0,
+                                            "at": now, "stopped": True})
+            stale = now - max(self.cfg.stop_after, 3600)
+            for p in [p for p, t in self.last_seen.items() if t < stale]:
+                del self.last_seen[p]
 
     def forget_expired(self) -> None:
         cutoff = time.time() - self.cfg.remember
@@ -413,10 +456,11 @@ def poll_once(plex: Plex, cfg: Config, pf: Prefetcher) -> None:
         s["size"] = s["size"] or _size_or_zero(s["path"])
         s["seen_at"] = time.time()
     pf.sessions = sessions
+    pf.saw_playing([s["path"] for s in sessions])
     for s in sessions:
         path, size = s["path"], s["size"]
         start = max(0, byte_offset(s["view_offset"], s["duration"], size) - cfg.seek_margin)
-        pf.submit(path, start=start, prio=PRIO_PLAYING)
+        pf.submit(path, start=start, prio=PRIO_PLAYING, owner=path)
 
         if s["type"] == "episode" and s["show_key"] and cfg.next_episodes > 0:
             try:
@@ -426,7 +470,7 @@ def poll_once(plex: Plex, cfg: Config, pf: Prefetcher) -> None:
                 continue
             for f in next_episode_files(leaves, s["rating_key"], cfg.next_episodes):
                 pf.submit(cfg.local_path(f), end=cfg.next_episode_head or None,
-                          prio=PRIO_NEXT)
+                          prio=PRIO_NEXT, owner=path)
 
     if cfg.on_deck:
         for f in on_deck_files(plex.get("/library/onDeck"), cfg.on_deck_limit):
@@ -497,6 +541,7 @@ def run_daemon(cfg: Config) -> None:
         try:
             poll_once(plex, cfg, pf)
             pf.last_poll = (time.time(), None)
+            pf.stop_abandoned()  # only after a good poll: if Plex is down, keep going
             pf.last_poll_secs = time.time() - t0
             if pf.last_poll_secs > 10:
                 log.warning("checking Plex took %.0fs; the media mount is slow to respond",
@@ -812,7 +857,8 @@ def render_status(d: dict, settings: str = "") -> str:
         f"{j['percent']}%</td><td>{_mbps(j['rate']) if j['rate'] else ''}</td></tr>"
         for j in d["jobs"]) or "<tr><td colspan=5 class=muted>Nothing being cached right now</td></tr>"
     recent = "".join(
-        f"<tr><td>{e(os.path.basename(r['path']))}</td><td>{r['mb']} MB</td>"
+        f"<tr><td>{e(os.path.basename(r['path']))}</td>"
+        f"<td>{'stopped (not watched)' if r.get('stopped') else str(r['mb']) + ' MB'}</td>"
         f"<td>{_mbps(r['mb'] * MB / r['secs']) if r['secs'] else ''}</td>"
         f"<td>{time.strftime('%H:%M', time.localtime(r['at']))}</td></tr>"
         for r in d["recent"]) or "<tr><td colspan=4 class=muted>None yet</td></tr>"
@@ -942,6 +988,9 @@ PREFETCH_FIELDS = [
     ("on_deck_head_mb", "MB from each Continue Watching item", "int", 0, 100000, ""),
     ("workers", "Downloads at once", "int", 1, 8,
      "1 on a slow link, so the playing file always comes first."),
+    ("stop_after_minutes", "Stop downloading after nobody's watching for (min)", "int", 0, 240,
+     "Once a stream is closed (not just paused) for this long, its download and upcoming "
+     "episodes stop. 0 never stops."),
     ("poll_interval", "Seconds between checks of Plex", "int", 2, 300, ""),
     ("remember_hours", "Hours before re-checking a cached file", "int", 0, 720,
      "Keep at or below the expiry below."),
@@ -1186,6 +1235,7 @@ def getattr_current(cfg: Config, key: str):
         "on_deck": "true" if cfg.on_deck else "", "on_deck_limit": cfg.on_deck_limit,
         "on_deck_head_mb": cfg.on_deck_head // MB, "workers": cfg.workers,
         "poll_interval": int(cfg.poll_interval), "remember_hours": int(cfg.remember / 3600),
+        "stop_after_minutes": int(cfg.stop_after / 60),
     }[key]
 
 

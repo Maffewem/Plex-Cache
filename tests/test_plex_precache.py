@@ -235,7 +235,7 @@ class SettingsTests(unittest.TestCase):
     def test_validation_rejects_bad_and_injected_values(self):
         good = {"next_episodes": "2", "next_episode_head_mb": "0", "on_deck_limit": "5",
                 "on_deck_head_mb": "512", "workers": "2", "poll_interval": "10",
-                "remember_hours": "12"}
+                "remember_hours": "12", "stop_after_minutes": "10"}
         self.assertEqual(pp.validate_prefetch(good)["on_deck"], "false")
         with self.assertRaises(pp.SettingsError):
             pp.validate_prefetch(dict(good, workers="0"))
@@ -317,6 +317,39 @@ class MountTests(unittest.TestCase):
                   cache={"mount": {}})
         titles = [c["title"] for c in pp.system_checks(d2)]
         self.assertIn("Media mount", titles)
+
+
+class StopAbandonedTests(unittest.TestCase):
+    def test_closed_stream_stops_its_downloads_but_paused_keeps_them(self):
+        with tempfile.TemporaryDirectory() as d:
+            files = {}
+            for name in ("ep1", "ep2", "film", "manual"):
+                files[name] = os.path.join(d, name)
+                with open(files[name], "wb") as f:
+                    f.write(b"x" * 100)
+            cfg = pp.Config(None)
+            cfg.stop_after = 600
+            pf = pp.Prefetcher(cfg)
+            pf.submit(files["ep1"], owner=files["ep1"])
+            pf.submit(files["ep2"], prio=pp.PRIO_NEXT, owner=files["ep1"])
+            pf.submit(files["film"], owner=files["film"])
+            pf.submit(files["manual"], prio=pp.PRIO_MANUAL)
+            now = pp.time.time()
+            pf.last_seen = {files["ep1"]: now - 700, files["film"]: now - 60}
+            pf.stop_abandoned()
+            self.assertEqual(sorted(os.path.basename(p) for p in pf.active),
+                             ["film", "manual"])
+            self.assertTrue(all(j.cancelled for _, _, j in pf.queue
+                                if j.owner == files["ep1"]))
+            # A cancelled read stops at once and isn't remembered as cached.
+            job = pp.Job(files["ep1"], 0, None, 0)
+            job.cancelled = True
+            self.assertEqual(pp.read_through(job, 10, threading.Event()), 0)
+            self.assertNotIn(files["ep1"], pf.done)
+            cfg.stop_after = 0  # 0 = never stop
+            pf.last_seen[files["film"]] = now - 99999
+            pf.stop_abandoned()
+            self.assertIn(files["film"], pf.active)
 
 
 class RecommendTests(unittest.TestCase):
