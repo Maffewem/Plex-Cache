@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+# Change how much local disk the Plex-Cache mount may use.
+#
+#   sudo plex-cache-resize 25G              # fixed cache size
+#   sudo plex-cache-resize --percent 70     # 70% of free disk after keeping --min-free spare
+#   sudo plex-cache-resize --min-free 15G   # change the spare-space floor (re-sizes if sized by percent)
+#   sudo plex-cache-resize --show           # print current settings
+#
+# Add --no-restart to save the change without restarting the mount (it applies
+# on the next restart). Restarting the mount briefly interrupts anything playing.
+set -euo pipefail
+
+ENV_FILE=${PLEX_CACHE_ENV:-/etc/plex-precache/rclone-mount.env}
+CONFIG=${PLEX_CACHE_CONFIG:-/etc/plex-precache/config.ini}
+SIZE="" PERCENT="" MIN_FREE="" RESTART=1 SHOW=0
+
+usage() { sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; }
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --percent) PERCENT="$2"; shift ;;
+    --min-free) MIN_FREE="$2"; shift ;;
+    --no-restart) RESTART=0 ;;
+    --show) SHOW=1 ;;
+    -h|--help) usage; exit 0 ;;
+    [0-9]*[GgMmTt]) SIZE="$1" ;;
+    *) echo "unknown argument: $1" >&2; usage >&2; exit 1 ;;
+  esac
+  shift
+done
+
+[ -f "$ENV_FILE" ] || { echo "$ENV_FILE not found; was install.sh run with --with-mount?" >&2; exit 1; }
+# shellcheck disable=SC1090
+. "$ENV_FILE"
+
+to_gb() {  # 25G -> 25, 512M -> 0, 1T -> 1024
+  local v=${1%[Bb]}
+  case "$v" in
+    *[Tt]) echo $(( ${v%[Tt]} * 1024 )) ;;
+    *[Gg]) echo "${v%[Gg]}" ;;
+    *[Mm]) echo $(( ${v%[Mm]} / 1024 )) ;;
+    *) echo "$v" ;;
+  esac
+}
+
+set_env() {  # key value
+  if grep -q "^$1=" "$ENV_FILE"; then
+    sed -i "s|^$1=.*|$1=$2|" "$ENV_FILE"
+  else
+    echo "$1=$2" >> "$ENV_FILE"
+  fi
+}
+
+if [ "$SHOW" -eq 1 ]; then
+  echo "Cache dir:      $CACHE_DIR"
+  echo "Cache max size: $CACHE_MAX_SIZE"
+  echo "Keep free:      $CACHE_MIN_FREE"
+  echo "Disk free now:  $(df -h --output=avail "$CACHE_DIR" | tail -1 | tr -d ' ')"
+  echo "In cache now:   $(du -sh "$CACHE_DIR" 2>/dev/null | cut -f1)"
+  exit 0
+fi
+
+[ "$(id -u)" -eq 0 ] || { echo "run as root (sudo)" >&2; exit 1; }
+[ -n "$SIZE$PERCENT$MIN_FREE" ] || { usage >&2; exit 1; }
+
+if [ -n "$MIN_FREE" ]; then
+  set_env CACHE_MIN_FREE "$MIN_FREE"
+  CACHE_MIN_FREE="$MIN_FREE"
+  # The prefetcher uses the same floor for speculative downloads.
+  [ -f "$CONFIG" ] && sed -i "s|^min_free_gb *=.*|min_free_gb = $(to_gb "$MIN_FREE")|" "$CONFIG"
+  [ -n "$SIZE$PERCENT" ] || PERCENT=${CACHE_PERCENT:-}
+fi
+
+if [ -n "$PERCENT" ]; then
+  [ "$PERCENT" -ge 1 ] && [ "$PERCENT" -le 100 ] || { echo "--percent must be 1-100" >&2; exit 1; }
+  # Free space counts what the cache already holds, since it can reuse that.
+  FREE_GB=$(df -P --block-size=1G "$CACHE_DIR" | awk 'NR==2 {print $4}')
+  USED_GB=$(( $(du -s --block-size=1G "$CACHE_DIR" 2>/dev/null | cut -f1 || echo 0) ))
+  AVAIL_GB=$(( FREE_GB + USED_GB - $(to_gb "$CACHE_MIN_FREE") ))
+  SIZE_GB=$(( AVAIL_GB * PERCENT / 100 ))
+  if [ "$SIZE_GB" -lt 5 ]; then
+    echo "Warning: only ${AVAIL_GB} GB usable for the cache; using 5G." >&2
+    SIZE_GB=5
+  fi
+  SIZE="${SIZE_GB}G"
+  set_env CACHE_PERCENT "$PERCENT"
+  echo "${PERCENT}% of ${AVAIL_GB} GB usable (keeping ${CACHE_MIN_FREE} free) = ${SIZE}"
+fi
+
+if [ -n "$SIZE" ]; then
+  # A fixed size stops later --min-free changes from re-sizing by percent.
+  [ -n "$PERCENT" ] || sed -i '/^CACHE_PERCENT=/d' "$ENV_FILE"
+  set_env CACHE_MAX_SIZE "$SIZE"
+  echo "Cache max size set to $SIZE"
+fi
+
+if [ "$RESTART" -eq 1 ] && systemctl is-active --quiet plex-cache-mount; then
+  echo "Restarting plex-cache-mount (playback pauses briefly)..."
+  systemctl restart plex-cache-mount
+  systemctl restart plex-precache 2>/dev/null || true
+elif systemctl is-active --quiet plex-precache 2>/dev/null && [ -n "$MIN_FREE" ]; then
+  systemctl restart plex-precache
+fi
