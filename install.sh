@@ -132,6 +132,16 @@ RCONF
     [ -n "$KNOWN_HOSTS" ] || echo "Note: no known_hosts entry for $SFTP_HOST found; rclone won't verify the host key." >&2
   fi
   [ -n "$MOUNT_AT" ] && set_env MOUNTPOINT "$MOUNT_AT"
+  # rclone 1.68+ can fetch one file over several connections at once, which is
+  # what a single 4K stream over a high-latency link needs.
+  if [ "$NEW_ENV" -eq 1 ]; then
+    RCLONE_VER="$(rclone version 2>/dev/null | sed -n 's/^rclone v\([0-9]*\)\.\([0-9]*\).*/\1 \2/p')"
+    if [ -n "$RCLONE_VER" ] && [ "${RCLONE_VER% *}" -ge 1 ] && \
+       { [ "${RCLONE_VER% *}" -gt 1 ] || [ "${RCLONE_VER#* }" -ge 68 ]; }; then
+      set_env EXTRA_ARGS "--vfs-read-chunk-streams 4"
+      echo "rclone ${RCLONE_VER/ /.}: downloading each file over 4 parallel streams."
+    fi
+  fi
   # shellcheck disable=SC1091
   . /etc/plex-precache/rclone-mount.env
   install -d -o "$RUN_USER" -g "$RUN_USER" "$CACHE_DIR"

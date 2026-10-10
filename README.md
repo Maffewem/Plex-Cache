@@ -91,6 +91,13 @@ To go back: `sudo systemctl disable --now plex-cache-mount`, restore
 If SSHFS is mounted by a script or service rather than fstab, disable that
 too, or it will try to mount over the new mount at boot.
 
+The prefetcher refuses to run on SSHFS, and the status page says so. Reading
+ahead there stores nothing locally and only competes with Plex for the same
+SSH connection. SSHFS also funnels everything through one connection, so a
+high-latency link tops out at a few MB/s, which is less than a 4K remux needs.
+On rclone 1.68 and later the installer adds `--vfs-read-chunk-streams 4`, so
+each file is fetched over several connections at once.
+
 ### Swizzin panel and status page
 
 If the Swizzin panel is installed, the installer adds a **Plex-Cache** tile to it

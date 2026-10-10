@@ -8,6 +8,9 @@ import xml.etree.ElementTree as ET
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import plex_precache as pp  # noqa: E402
 
+# Tests read local temp files, which are not a caching mount.
+pp.DEFAULTS["require_cache_mount"] = "false"
+
 SESSIONS = """<MediaContainer size="2">
   <Video ratingKey="102" type="episode" grandparentRatingKey="100" grandparentTitle="Show"
          title="Ep 2" viewOffset="600000" duration="2400000">
@@ -274,6 +277,46 @@ class SettingsTests(unittest.TestCase):
         for bad in ("../", "/../../etc", "Show/../../.."):
             with self.assertRaises(pp.SettingsError):
                 pp.warm_path(cfg, pf, bad)
+
+
+MOUNTS = """/dev/sda1 / ext4 rw,relatime 0 0
+user@1.2.3.4:/home/user/data /data fuse.sshfs rw,nosuid,user_id=0 0 0
+box:media /mnt/remote fuse.rclone rw,nosuid,user_id=1000 0 0
+srv:/x /mnt/my\\040nfs nfs4 rw,fsc,vers=4.2 0 0
+srv:/y /mnt/nfsplain nfs4 rw,vers=4.2 0 0
+"""
+
+
+class MountTests(unittest.TestCase):
+    def test_mount_detection(self):
+        self.assertEqual(pp.mount_info("/data/Movies/x.mkv", MOUNTS)[:2], ("/data", "fuse.sshfs"))
+        self.assertEqual(pp.mount_info("/database/x", MOUNTS)[:2], ("/", "ext4"))
+        self.assertEqual(pp.mount_info("/mnt/my nfs/a.mkv", MOUNTS)[:2], ("/mnt/my nfs", "nfs4"))
+        cached = {p: pp.caches_to_disk(*pp.mount_info(p, MOUNTS)[1:])
+                  for p in ("/data/a", "/mnt/remote/a", "/mnt/my nfs/a", "/mnt/nfsplain/a", "/x")}
+        self.assertEqual(cached, {"/data/a": False, "/mnt/remote/a": True, "/mnt/my nfs/a": True,
+                                  "/mnt/nfsplain/a": False, "/x": False})
+
+    def test_uncached_mount_blocks_prefetch_and_is_reported(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "a.mkv")
+            open(path, "wb").close()
+            cfg = pp.Config(None)
+            cfg.require_cache_mount = True
+            pf = pp.Prefetcher(cfg)
+            pf.submit(path)  # a temp dir is never an rclone mount
+            self.assertEqual(len(pf.queue), 0)
+            self.assertEqual(len(pf.blocked), 1)
+        s = {"file": "/data/a.mkv", "path": "/data/a.mkv", "state": "playing"}
+        d2 = {"jobs": [], "done": {}, "warned": [], "blocked": {"/data": "fuse.sshfs"}}
+        h = pp.stream_health(s, d2)
+        self.assertEqual(h["level"], pp.BAD)
+        self.assertIn("can't cache", h["detail"])
+        self.assertEqual(pp.stream_health(s, dict(d2, blocked={"/": "ext4"}))["level"], pp.GOOD)
+        d2.update(poll_error=None, last_poll=0, sessions=[], recent=[], streams=[],
+                  cache={"mount": {}})
+        titles = [c["title"] for c in pp.system_checks(d2)]
+        self.assertIn("Media mount", titles)
 
 
 if __name__ == "__main__":

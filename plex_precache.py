@@ -53,6 +53,7 @@ DEFAULTS = {
     "status_bind": "127.0.0.1",
     "status_port": "8789",
     "mount_env": "/etc/plex-precache/rclone-mount.env",
+    "require_cache_mount": "true",
 }
 
 # Lower number runs first.
@@ -91,6 +92,7 @@ class Config:
         self.status_bind = s.get("status_bind")
         self.status_port = s.getint("status_port")
         self.mount_env = s.get("mount_env")
+        self.require_cache_mount = s.getboolean("require_cache_mount")
         # Longest prefix first so nested mappings win.
         self.path_map = sorted(cp["path_map"].items(), key=lambda kv: -len(kv[0]))
 
@@ -249,6 +251,8 @@ class Prefetcher:
         self.last_poll: tuple[float, str | None] = (0.0, None)
         self.warned: set[str] = set()
         self.n_workers = 0
+        self.last_poll_secs = 0.0
+        self.blocked: dict[str, str] = {}  # mountpoint -> fstype we won't prefetch on
 
     def submit(self, path: str, start: int = 0, end: int | None = None,
                prio: int = PRIO_PLAYING) -> None:
@@ -260,18 +264,47 @@ class Prefetcher:
             finished = self.done.get(path)
             if finished and time.time() - finished < self.cfg.remember:
                 return
-            if not os.path.isfile(path):
-                if path not in self.warned:
-                    self.warned.add(path)
-                    log.warning("not found locally (check [path_map]): %s", path)
+        if self.cfg.require_cache_mount and self.uncached_mount(path):
+            return
+        # File checks happen outside the lock: on a busy network mount a stat
+        # can take seconds, and holding the lock would stall polling and the
+        # status page.
+        if not os.path.isfile(path):
+            if path not in self.warned:
+                self.warned.add(path)
+                log.warning("not found locally (check [path_map]): %s", path)
+            return
+        if prio != PRIO_PLAYING and not self.has_room(path, start, end):
+            return
+        job = Job(path, start, end, prio)
+        with self.cv:
+            if path in self.active:
+                self.active[path].jump_to(start)
                 return
-            if prio != PRIO_PLAYING and not self.has_room(path, start, end):
-                return
-            job = Job(path, start, end, prio)
             self.active[path] = job
             heapq.heappush(self.queue, (prio, next(self.counter), job))
             self.cv.notify()
-            log.info("queued %s from %d MB (prio %d)", path, start // MB, prio)
+        log.info("queued %s from %d MB (prio %d)", path, start // MB, prio)
+
+    def uncached_mount(self, path: str) -> str | None:
+        """The mountpoint if `path` is on a filesystem that can't cache to disk.
+
+        Reading ahead there doesn't keep anything locally; it only competes with
+        Plex for the same link, so it's skipped.
+        """
+        mnt, fstype, opts = mount_info(path)
+        if caches_to_disk(fstype, opts):
+            return None
+        if mnt not in self.blocked:
+            self.blocked[mnt] = fstype
+            if fstype in LOCAL_FSTYPES:
+                log.info("not pre-caching under %s: it's a local disk (%s)", mnt, fstype)
+                return mnt
+            log.warning("not pre-caching under %s: %s can't keep a disk cache, so reading "
+                        "ahead would only compete with Plex. Use the cached rclone mount "
+                        "(install.sh --sftp ...), or set require_cache_mount = false.",
+                        mnt, fstype)
+        return mnt
 
     def has_room(self, path: str, start: int, end: int | None) -> bool:
         """Whether caching this file would leave `min_free_gb` on the cache disk.
@@ -360,7 +393,8 @@ class Prefetcher:
         polled, err = self.last_poll
         with self.cv:
             done = dict(self.done)
-        return {"jobs": rows, "done": done, "warned": sorted(self.warned), "recent": list(self.recent), "sessions": self.sessions,
+        return {"jobs": rows, "done": done, "poll_secs": self.last_poll_secs, "warned": sorted(self.warned),
+                "blocked": dict(self.blocked), "recent": list(self.recent), "sessions": self.sessions,
                 "last_poll": polled, "poll_error": err}
 
     def shutdown(self, *_args) -> None:
@@ -396,6 +430,45 @@ def poll_once(plex: Plex, cfg: Config, pf: Prefetcher) -> None:
             pf.submit(cfg.local_path(f), end=cfg.on_deck_head or None, prio=PRIO_ON_DECK)
 
 
+# Filesystems where reading a file leaves a copy on local disk.
+DISK_CACHING_FSTYPES = {"fuse.rclone"}
+# Local disks: nothing to pre-cache, the media is already here.
+LOCAL_FSTYPES = {"ext2", "ext3", "ext4", "xfs", "btrfs", "zfs", "f2fs", "overlay", "tmpfs",
+                 "vfat", "exfat", "ntfs", "ntfs3", "fuseblk", "fuse.mergerfs"}
+# Network filesystems that do, but only when mounted with the `fsc` option.
+FSCACHE_FSTYPES = {"nfs", "nfs4", "cifs", "smb3"}
+
+
+def _unescape_mount(field: str) -> str:
+    return re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), field)
+
+
+def mount_info(path: str, mounts_text: str | None = None) -> tuple[str, str, str]:
+    """(mountpoint, fstype, options) for the mount holding `path`, without touching it."""
+    if mounts_text is None:
+        try:
+            with open("/proc/mounts") as f:
+                mounts_text = f.read()
+        except OSError:
+            return "/", "unknown", ""
+    path = os.path.abspath(path)
+    best = ("/", "unknown", "")
+    for line in mounts_text.splitlines():
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        mnt = _unescape_mount(parts[1])
+        inside = path == mnt or path.startswith(mnt.rstrip("/") + "/")
+        if inside and len(mnt) >= len(best[0]):
+            best = (mnt, parts[2], parts[3])
+    return best
+
+
+def caches_to_disk(fstype: str, opts: str) -> bool:
+    return fstype in DISK_CACHING_FSTYPES or (
+        fstype in FSCACHE_FSTYPES and "fsc" in opts.split(","))
+
+
 def _size_or_zero(path: str) -> int:
     try:
         return os.path.getsize(path)
@@ -417,9 +490,14 @@ def run_daemon(cfg: Config) -> None:
     log.info("watching %s every %.0fs with %d workers",
              cfg.plex_url, cfg.poll_interval, cfg.workers)
     while not pf.stop.is_set():
+        t0 = time.time()
         try:
             poll_once(plex, cfg, pf)
             pf.last_poll = (time.time(), None)
+            pf.last_poll_secs = time.time() - t0
+            if pf.last_poll_secs > 10:
+                log.warning("checking Plex took %.0fs; the media mount is slow to respond",
+                            pf.last_poll_secs)
         except (OSError, ET.ParseError) as e:
             log.warning("poll failed: %s", e)
             pf.last_poll = (time.time(), str(e))
@@ -583,6 +661,13 @@ def stream_health(s: dict, d: dict, now: float | None = None) -> dict:
         else:
             level, msg = GOOD, (f"{_dur(ahead_s or 0)} cached ahead, {speed}"
                                 + (f" ({ratio:.1f}x real time)." if ratio else "."))
+    elif blocked_fs := next((fs for m, fs in d.get("blocked", {}).items()
+                             if path == m or path.startswith(m.rstrip("/") + "/")), None):
+        if blocked_fs in LOCAL_FSTYPES:
+            level, msg = GOOD, "On a local disk, so it doesn't need pre-caching."
+        else:
+            level, msg = BAD, ("Not pre-cached: the media folder is a mount that can't cache "
+                               "to disk, so this plays straight over the network (see Health).")
     elif path in d.get("warned", []):
         level, msg = BAD, ("File isn't visible on this box, so it can't be cached. "
                            "Check the mount and [path_map].")
@@ -607,8 +692,22 @@ def system_checks(d: dict) -> list[dict]:
     elif time.time() - d["last_poll"] > 3 * d.get("poll_interval", 10) + 5:
         checks.append({"level": WARN, "title": "Plex",
                        "detail": "Last successful check was a while ago."})
+    elif d.get("poll_secs", 0) > 10:
+        checks.append({"level": WARN, "title": "Plex", "detail":
+            f"Each check is taking {d['poll_secs']:.0f}s because the media folder is slow to "
+            "respond, so new streams show up late."})
     else:
         checks.append({"level": GOOD, "title": "Plex", "detail": "Connected."})
+
+    for mnt, fstype in d.get("blocked", {}).items():
+        if fstype in LOCAL_FSTYPES:
+            continue
+        hint = (" Switch to the cached rclone mount with install.sh --sftp (see the README's "
+                "\"Coming from SSHFS\")." if fstype == "fuse.sshfs" else
+                " Mount it through the cached rclone mount instead.")
+        checks.append({"level": BAD, "title": "Media mount", "detail":
+            f"{mnt} is {fstype}, which can't keep a disk cache. Pre-caching is paused there "
+            f"because it would only compete with Plex for the same link.{hint}"})
 
     disk = c.get("disk")
     if disk:
