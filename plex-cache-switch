@@ -50,6 +50,12 @@ say() {  # progress line, also kept for the status page
 }
 fail() { say "$1"; exit 1; }
 
+# Older rclone (e.g. a distro package) lacks flags the mount unit uses, and the
+# mount would fail to start. Check before touching anything.
+if [ "$MODE" != back ] && ! "$RCLONE" mount --help 2>/dev/null | grep -q -- '--vfs-cache-min-free-space'; then
+  fail "$("$RCLONE" version 2>/dev/null | head -1 || echo rclone) is too old for the cached mount. Upgrade it with: curl https://rclone.org/install.sh | sudo bash. Nothing was changed."
+fi
+
 env_get() { sed -n "s/^$1=//p" "$ENV_FILE" | tail -1 | sed 's/^"\(.*\)"$/\1/'; }
 set_env() {  # key value; values with spaces are quoted so bash can source the file
   local v="$2"

@@ -1760,7 +1760,9 @@ the new mount doesn't show your files, SSHFS is put back.</p>
     elif mm and mm["undo"]:
         switch_form = f"""
 <div class=panel><h3>Media mount</h3>
-<p>{e(mm["where"])} is the cached rclone mount.</p>
+<p>{e(mm["where"])} {"is the cached rclone mount." if mm["fstype"] == "fuse.rclone" else
+  "should be the cached rclone mount, but it isn't running, so Plex sees no media. Check "
+  "<code>journalctl -u plex-cache-mount</code>, or go back to SSHFS."}</p>
 <form method=post action=switch/back>{hidden}
 <button>Go back to SSHFS</button>
 <span class=muted>Plex pauses for a moment, and pre-caching stops until you switch again.</span>

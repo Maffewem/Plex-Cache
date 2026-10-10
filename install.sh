@@ -104,6 +104,10 @@ sed "s/@USER@/$RUN_USER/g" systemd/plex-precache.service > /etc/systemd/system/p
 
 if [ "$WITH_MOUNT" -eq 1 ]; then
   command -v rclone >/dev/null || { echo "rclone not found: install it first (box install rclone)" >&2; exit 1; }
+  if ! rclone mount --help 2>/dev/null | grep -q -- '--vfs-cache-min-free-space'; then
+    echo "Warning: $(rclone version 2>/dev/null | head -1) is too old for the cached mount." >&2
+    echo "  Upgrade it with: curl https://rclone.org/install.sh | sudo bash" >&2
+  fi
   NEW_ENV=0
   if [ ! -f /etc/plex-precache/rclone-mount.env ]; then
     sed "s|/home/USER/|/home/$RUN_USER/|" systemd/rclone-mount.env.example > /etc/plex-precache/rclone-mount.env
