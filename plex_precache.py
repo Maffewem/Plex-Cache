@@ -1286,6 +1286,10 @@ def latest_release() -> tuple[str, str] | None:
     return (v.group(1), r.group(1) if r else "") if v else None
 
 
+def version_tuple(v: str) -> tuple[int, ...]:
+    return tuple(int(x) for x in re.findall(r"\d+", v)[:3])
+
+
 def check_for_update() -> str:
     try:
         out = subprocess.run(["git", "ls-remote", UPDATE_REPO, "refs/heads/main"],
@@ -1298,6 +1302,9 @@ def check_for_update() -> str:
     if latest == installed_version():
         return f"You're on the latest version, {version_label()}."
     rel = latest_release()
+    if rel and version_tuple(rel[0]) < version_tuple(__version__):
+        return (f"You're on {version_label()}, which is newer than the released "
+                f"version ({rel[0]}). Nothing to update.")
     name = f"Version {version_label(*rel)}" if rel and rel[0] != __version__ else \
         f"A newer build ({latest})"
     return f"{name} is available; you have {version_label()}. Use Update now to install it."

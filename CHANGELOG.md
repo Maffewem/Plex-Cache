@@ -11,7 +11,8 @@ The version is shown on the status page (`/plexcache/`) and by
   recommended settings worked out from the server's disk, RAM and CPU.
 - Fresh installs are tuned to the server automatically.
 - Updates: `sudo plex-cache-update`, an Update button on the page, or
-  nightly automatic updates.
+  nightly automatic updates. The updater never installs an older version than
+  the one running.
 - Switch from SSHFS to a cached rclone SFTP mount with
   `install.sh --sftp ... --replace-sshfs`.
 - Pre-caching pauses on mounts that can't cache (such as SSHFS) instead of
