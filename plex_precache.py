@@ -916,6 +916,8 @@ td.k+td{{width:1%}}progress{{width:90px}}html,body{{overflow-x:hidden}}{SETTINGS
 <button id=toggle class='live on' type=button aria-pressed=false
 title="Pause or resume live updates"><span class=dot></span><b id=livetext>Live</b>
 <span class=sub id=updated></span></button></div>
+{'<nav class=tabs><a href="#status" data-tab=status>Status</a><a href="#settings" data-tab=settings>Settings</a></nav>' if settings else ''}
+<div id=status-tab>
 <div id=main>
 <div class='verdict {overall}'>{e(verdict)}</div>
 <div class=stats><div><b>{_gb(c['used'])}</b><span class=muted>cached
@@ -931,7 +933,6 @@ title="Pause or resume live updates"><span class=dot></span><b id=livetext>Live<
 <th>At</th></tr>{recent}</table></div>
 <p class=muted>{limits or 'Mount settings not readable'}</p>
 </div>
-{settings}
 <details><summary>What's normal?</summary>
 <p><b>Good</b>: the cache is at least {AHEAD_GOOD_S // 60} minutes ahead of playback and
 the link downloads at least {SPEED_GOOD_RATIO}x faster than the video plays, or the file is
@@ -943,6 +944,8 @@ there's little slack.</p>
 slower than the video's bitrate, or the disk is below its free-space floor. Fixes: pre-warm
 with --warm before watching, lower the quality in Plex, or give the cache more disk.</p>
 </details>
+</div>
+{settings}
 <script>
 (function () {{
   var paused = false, last = Date.now(), failed = false;
@@ -974,6 +977,52 @@ with --warm before watching, lower the quality in Plex, or give the cache more d
       last = Date.now(); failed = false; label();
     }}).catch(function () {{ failed = true; label(); }});
   }}
+  // Status and Settings tabs, and settings panels that fold away. Without
+  // JavaScript everything shows on one page.
+  var tabs = document.querySelectorAll(".tabs a"), statusTab = document.getElementById("status-tab"),
+      settingsTab = document.getElementById("settings");
+  function showTab(name) {{
+    if (!settingsTab) return;
+    statusTab.hidden = name !== "status"; settingsTab.hidden = name !== "settings";
+    tabs.forEach(function (a) {{ a.classList.toggle("on", a.dataset.tab === name); }});
+    try {{ localStorage.setItem("plexcache-tab", name); }} catch (e) {{}}
+  }}
+  tabs.forEach(function (a) {{
+    a.addEventListener("click", function (ev) {{
+      ev.preventDefault(); showTab(a.dataset.tab); window.scrollTo(0, 0);
+    }});
+  }});
+  var hash = location.hash.slice(1), tab = "status";
+  try {{ tab = localStorage.getItem("plexcache-tab") || "status"; }} catch (e) {{}}
+  if (hash === "settings" || hash.indexOf("s-") === 0) tab = "settings";
+  if (hash === "status") tab = "status";
+  showTab(tab);
+  var heading = settingsTab && settingsTab.querySelector("h2");
+  if (heading && tabs.length) heading.hidden = true;  // the tab already says it
+  var open = {{}};
+  try {{ open = JSON.parse(localStorage.getItem("plexcache-open") || "{{}}"); }} catch (e) {{}}
+  document.querySelectorAll("#settings .panel[id]").forEach(function (panel) {{
+    var h = panel.querySelector("h3");
+    if (!h) return;
+    // Folded unless opened before, just saved, or asking for action (the SSHFS switch).
+    var isOpen = open[panel.id] !== undefined ? open[panel.id]
+                 : panel.classList.contains("badbox");
+    if (hash === panel.id) isOpen = true;
+    h.setAttribute("role", "button"); h.tabIndex = 0;
+    function set(v) {{
+      panel.classList.toggle("collapsed", !v); h.setAttribute("aria-expanded", v ? "true" : "false");
+    }}
+    function flip() {{
+      var v = panel.classList.contains("collapsed"); set(v); open[panel.id] = v;
+      try {{ localStorage.setItem("plexcache-open", JSON.stringify(open)); }} catch (e) {{}}
+    }}
+    h.addEventListener("click", flip);
+    h.addEventListener("keydown", function (ev) {{
+      if (ev.key === "Enter" || ev.key === " ") {{ ev.preventDefault(); flip(); }}
+    }});
+    set(isOpen);
+  }});
+
   // Saving a setting reloads the page; come back to the same spot.
   document.querySelectorAll("#settings form").forEach(function (f) {{
     f.addEventListener("submit", function () {{
@@ -1730,13 +1779,13 @@ def render_settings(cfg: Config, token: str, msg: str | None, ok: bool,
               f"onclick=\"this.parentNode.remove()\">&times;</button></div>" if msg else "")
     hidden = f"<input type=hidden name=token value='{token}'>"
     mount_form = f"""
-<form method=post action=settings/mount class=panel id=s-mount>{hidden}
-<h3>Cache</h3>{mount}
+<div class=panel id=s-mount><h3>Cache</h3>
+<form method=post action=settings/mount>{hidden}{mount}
 <label class=check><input type=checkbox name=restart value=now checked>
 Restart the mount now so changes apply (anything playing pauses for a few seconds)</label>
 <button>Save cache settings</button></form>
 <form method=post action=restart-mount class=inline>{hidden}
-<button>Restart mount only</button></form>""" if has_mount else ""
+<button>Restart mount only</button></form></div>""" if has_mount else ""
     conn_form = ""
     sftp = sftp_settings(cfg) if has_mount else None
     if sftp:
@@ -1829,6 +1878,17 @@ onchange="this.form.submit()"> Install updates automatically each night</label>
 
 SETTINGS_CSS = """
 #settings .panel{background:var(--card);border-radius:6px;padding:12px;margin:12px 0}
+.tabs{display:flex;gap:4px;margin:14px 0 0;border-bottom:1px solid var(--line)}
+.tabs a{padding:8px 14px;color:var(--muted);text-decoration:none;font-weight:600;
+border-bottom:2px solid transparent;margin-bottom:-1px}
+.tabs a.on{color:var(--fg);border-bottom-color:var(--info)}
+#settings h3[role=button]{cursor:pointer;margin:0;user-select:none}
+#settings h3[role=button]::before{content:"\\25BE";display:inline-block;width:1.2em;
+font-size:12px;vertical-align:1px;
+transition:transform .15s}
+#settings .collapsed h3[role=button]::before{transform:rotate(-90deg)}
+#settings .panel:not(.collapsed) h3[role=button]{margin-bottom:8px}
+#settings .panel.collapsed>:not(h3){display:none}
 #settings h3{font-size:15px;margin:0 0 8px}.field{display:block;margin:10px 0}
 .field span{display:block;font-weight:600;font-size:14px;margin-bottom:3px}
 #settings h4{font-size:14px;margin:16px 0 4px}

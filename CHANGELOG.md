@@ -22,6 +22,7 @@ The version is shown on the status page (`/plexcache/`) and by
 - Downloads stop once nobody has watched the stream for 10 minutes
   (adjustable).
 - `plex-cache-resize --max-age` sets how long unwatched files stay cached.
+- Status and Settings are separate tabs, and each settings panel folds away.
 - Saving a setting keeps your place on the page and shows the result in a
   pop-up at the bottom instead of jumping to the top.
 - The SFTP connection (server, user, port, folder, mount location, SSH key)
