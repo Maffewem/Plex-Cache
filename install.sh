@@ -67,7 +67,7 @@ install -m 755 plex_precache.py uninstall.sh /opt/plex-precache/
 install -m 755 plex-cache-resize /usr/local/bin/plex-cache-resize
 
 if [ ! -f /etc/plex-precache/config.ini ]; then
-  install -m 640 -o root -g "$RUN_USER" config.example.ini /etc/plex-precache/config.ini
+  install -m 640 -o "$RUN_USER" -g "$RUN_USER" config.example.ini /etc/plex-precache/config.ini
   PREFS="/var/lib/plexmediaserver/Library/Application Support/Plex Media Server/Preferences.xml"
   if [ -f "$PREFS" ]; then
     TOKEN="$(grep -o 'PlexOnlineToken="[^"]*"' "$PREFS" | cut -d'"' -f2 || true)"
@@ -229,6 +229,28 @@ if [ -f /install/.panel.lock ] && [ -d /opt/swizzin/core ]; then
   touch /install/.plexcache.lock
   systemctl restart panel 2>/dev/null || true
   echo "Added Plex-Cache to the Swizzin panel."
+fi
+
+# The status page edits these, so the service user owns them (the directory
+# stays root's). It may restart only these two units, without a password.
+chown "$RUN_USER": /etc/plex-precache/config.ini
+chmod 640 /etc/plex-precache/config.ini
+[ -f /etc/plex-precache/rclone-mount.env ] && chown "$RUN_USER": /etc/plex-precache/rclone-mount.env
+SUDOERS=/etc/sudoers.d/plex-cache
+{
+  echo "# Lets the Plex-Cache status page apply settings. Added by Plex-Cache install.sh."
+  for unit in plex-cache-mount plex-precache; do
+    for bin in /usr/bin/systemctl /bin/systemctl; do
+      echo "$RUN_USER ALL=(root) NOPASSWD: $bin restart $unit"
+    done
+  done
+} > "$SUDOERS.tmp"
+chmod 440 "$SUDOERS.tmp"
+if command -v visudo >/dev/null && visudo -cf "$SUDOERS.tmp" >/dev/null; then
+  mv "$SUDOERS.tmp" "$SUDOERS"
+else
+  rm -f "$SUDOERS.tmp"
+  echo "Note: couldn't add the sudo rule; the status page can save settings but not restart the mount." >&2
 fi
 
 # Let `box remove plexcache` uninstall it.

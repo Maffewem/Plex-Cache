@@ -17,12 +17,15 @@ import configparser
 import heapq
 import html
 import http.server
-import json
 import itertools
-import shutil
+import json
 import logging
 import os
+import re
+import secrets
+import shutil
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -56,6 +59,7 @@ DEFAULTS = {
 PRIO_PLAYING = 0
 PRIO_NEXT = 1
 PRIO_ON_DECK = 2
+PRIO_MANUAL = 3
 
 MB = 1024 * 1024
 
@@ -65,6 +69,7 @@ class Config:
         cp = configparser.ConfigParser()
         cp.optionxform = str  # keep path_map keys case-sensitive
         cp.read_dict({"plex": DEFAULTS, "path_map": {}})
+        self.path = path
         if path:
             if not cp.read(path):
                 raise SystemExit(f"config file not readable: {path}")
@@ -243,6 +248,7 @@ class Prefetcher:
         self.sessions: list[dict] = []
         self.last_poll: tuple[float, str | None] = (0.0, None)
         self.warned: set[str] = set()
+        self.n_workers = 0
 
     def submit(self, path: str, start: int = 0, end: int | None = None,
                prio: int = PRIO_PLAYING) -> None:
@@ -284,10 +290,22 @@ class Prefetcher:
             return False
         return True
 
+    def ensure_workers(self) -> None:
+        """Start or retire worker threads to match cfg.workers (settable live)."""
+        with self.cv:
+            missing = max(0, self.cfg.workers - self.n_workers)
+            self.n_workers += missing
+            self.cv.notify_all()  # lets surplus workers notice and exit
+        for _ in range(missing):
+            threading.Thread(target=self.worker, daemon=True).start()
+
     def worker(self) -> None:
         while not self.stop.is_set():
             with self.cv:
                 while not self.queue and not self.stop.is_set():
+                    if self.n_workers > self.cfg.workers:
+                        self.n_workers -= 1
+                        return
                     self.cv.wait(timeout=1)
                 if self.stop.is_set():
                     return
@@ -332,7 +350,8 @@ class Prefetcher:
                 "pos": pos,
                 "rate": job.rate,
                 "kind": {PRIO_PLAYING: "playing", PRIO_NEXT: "next episode",
-                         PRIO_ON_DECK: "on deck"}.get(job.prio, str(job.prio)),
+                         PRIO_ON_DECK: "on deck", PRIO_MANUAL: "requested"}.get(
+                             job.prio, str(job.prio)),
                 "state": "reading" if job.started_at else "queued",
                 "percent": round(100 * min(1.0, max(0, pos - job.start) / span)),
                 "mb_s": (round((pos - job.start) / MB / max(1, time.time() - job.started_at), 1)
@@ -392,9 +411,7 @@ def run_daemon(cfg: Config) -> None:
     pf = Prefetcher(cfg)
     signal.signal(signal.SIGTERM, pf.shutdown)
     signal.signal(signal.SIGINT, pf.shutdown)
-    threads = [threading.Thread(target=pf.worker, daemon=True) for _ in range(cfg.workers)]
-    for t in threads:
-        t.start()
+    pf.ensure_workers()
     if cfg.status_port:
         start_status_server(cfg, pf)
     log.info("watching %s every %.0fs with %d workers",
@@ -408,8 +425,6 @@ def run_daemon(cfg: Config) -> None:
             pf.last_poll = (time.time(), str(e))
         pf.forget_expired()
         pf.stop.wait(cfg.poll_interval)
-    for t in threads:
-        t.join(timeout=5)
 
 
 # --------------------------------------------------------------------------
@@ -664,7 +679,7 @@ VERDICT = {
 }
 
 
-def render_status(d: dict) -> str:
+def render_status(d: dict, settings: str = "") -> str:
     e = html.escape
     c = d["cache"]
     m = c["mount"]
@@ -730,7 +745,7 @@ var(--info);border-radius:6px;padding:10px 12px;margin:8px 0}}.card p{{margin:6p
 .bar i{{display:block;height:100%;background:var(--good)}}.card.warn .bar i{{background:var(--warn)}}
 .card.bad .bar i{{background:var(--bad)}}button{{font:inherit;font-size:13px;padding:3px 10px}}
 details{{margin-top:24px}}.scroll{{overflow-x:auto}}td.k{{white-space:nowrap}}
-td.k+td{{width:1%}}progress{{width:90px}}html,body{{overflow-x:hidden}}</style></head><body>
+td.k+td{{width:1%}}progress{{width:90px}}html,body{{overflow-x:hidden}}{SETTINGS_CSS}</style></head><body>
 <div class=row><h1>Plex-Cache</h1><span class=muted><span id=updated></span>
 <button id=toggle type=button>Pause</button></span></div>
 <div id=main>
@@ -748,6 +763,7 @@ td.k+td{{width:1%}}progress{{width:90px}}html,body{{overflow-x:hidden}}</style><
 <th>At</th></tr>{recent}</table></div>
 <p class=muted>{limits or 'Mount settings not readable'}</p>
 </div>
+{settings}
 <details><summary>What's normal?</summary>
 <p><b>Good</b>: the cache is at least {AHEAD_GOOD_S // 60} minutes ahead of playback and
 the link downloads at least {SPEED_GOOD_RATIO}x faster than the video plays, or the file is
@@ -791,19 +807,313 @@ with --warm before watching, lower the quality in Plex, or give the cache more d
 </script></body></html>"""
 
 
+# --------------------------------------------------------------------------
+# Settings editable from the status page
+
+# (key, label, kind, min, max, help). Applied live, no restart needed.
+PREFETCH_FIELDS = [
+    ("next_episodes", "Upcoming episodes to pre-cache", "int", 0, 10,
+     "After the episode that's playing. 0 turns it off."),
+    ("next_episode_head_mb", "Only the first N MB of each", "int", 0, 100000,
+     "0 caches whole episodes. A few hundred MB covers the start on a slow link."),
+    ("on_deck", "Pre-cache Continue Watching", "bool", 0, 1,
+     "Warm the start of what you're likely to watch next."),
+    ("on_deck_limit", "Continue Watching items", "int", 0, 50, ""),
+    ("on_deck_head_mb", "MB from each Continue Watching item", "int", 0, 100000, ""),
+    ("workers", "Downloads at once", "int", 1, 8,
+     "1 on a slow link, so the playing file always comes first."),
+    ("poll_interval", "Seconds between checks of Plex", "int", 2, 300, ""),
+    ("remember_hours", "Hours before re-checking a cached file", "int", 0, 720,
+     "Keep at or below the expiry below."),
+]
+# rclone mount settings; saving restarts the mount.
+MOUNT_FIELDS = [
+    ("CACHE_MAX_SIZE", "Cache size", "size",
+     "Total disk the cache may use, e.g. 20G. Leave blank to use the percentage."),
+    ("CACHE_PERCENT", "...or % of usable disk", "percent",
+     "Sizes the cache to this share of free disk after the floor below. Blank to use a fixed size."),
+    ("CACHE_MIN_FREE", "Always keep free on disk", "size",
+     "rclone evicts files to keep this free, and pre-caching pauses below it."),
+    ("CACHE_MAX_AGE", "Drop files unwatched for", "duration", "e.g. 72h, 7d, 2w."),
+    ("READ_AHEAD", "Read ahead per stream", "size", "How far rclone downloads ahead of Plex."),
+    ("BUFFER_SIZE", "RAM buffer per stream", "size", "Memory per open file, e.g. 128M."),
+]
+SIZE_RE = re.compile(r"^\d+(\.\d+)?[KMGT]$")
+DURATION_RE = re.compile(r"^\d+[smhdwMy]$")
+
+
+class SettingsError(ValueError):
+    pass
+
+
+def validate_prefetch(form: dict) -> dict:
+    out = {}
+    for key, label, kind, lo, hi, _help in PREFETCH_FIELDS:
+        if kind == "bool":
+            out[key] = "true" if form.get(key) in ("on", "true", "1") else "false"
+            continue
+        raw = (form.get(key) or "").strip()
+        if not raw.isdigit() or not lo <= int(raw) <= hi:
+            raise SettingsError(f"{label} must be a whole number from {lo} to {hi}.")
+        out[key] = raw
+    return out
+
+
+def validate_mount(form: dict) -> dict:
+    out = {}
+    for key, label, kind, _help in MOUNT_FIELDS:
+        raw = (form.get(key) or "").strip().upper() if kind == "size" else (form.get(key) or "").strip()
+        if kind == "percent":
+            if raw and (not raw.isdigit() or not 1 <= int(raw) <= 100):
+                raise SettingsError(f"{label} must be from 1 to 100, or blank.")
+        elif kind == "size" and not SIZE_RE.match(raw):
+            if key == "CACHE_MAX_SIZE" and not raw and form.get("CACHE_PERCENT", "").strip():
+                pass
+            else:
+                raise SettingsError(f"{label} must be a size like 512M or 20G.")
+        elif kind == "duration" and not DURATION_RE.match(raw):
+            raise SettingsError(f"{label} must be a duration like 72h, 7d or 2w.")
+        out[key] = raw
+    return out
+
+
+def size_from_percent(cache_dir: str, percent: int, min_free: int) -> str:
+    """Same rule as plex-cache-resize: % of (free + already cached - floor)."""
+    free = shutil.disk_usage(cache_dir).free
+    usable = free + (dir_usage(cache_dir, max_age=0) or 0) - min_free
+    return f"{max(5, int(usable * percent / 100 / 1024 / MB))}G"
+
+
+def update_ini(path: str, values: dict) -> None:
+    """Set keys in the [plex] section, keeping comments and layout."""
+    with open(path) as f:
+        lines = f.read().splitlines()
+    section, seen = None, set()
+    for i, line in enumerate(lines):
+        m = re.match(r"^\s*\[([^]]+)\]", line)
+        if m:
+            section = m.group(1)
+            continue
+        m = re.match(r"^\s*([A-Za-z_]+)\s*=", line)
+        if section == "plex" and m and m.group(1) in values:
+            lines[i] = f"{m.group(1)} = {values[m.group(1)]}"
+            seen.add(m.group(1))
+    missing = [k for k in values if k not in seen]
+    if missing:
+        at = next((i for i, l in enumerate(lines) if l.strip() == "[plex]"), None)
+        new = [f"{k} = {values[k]}" for k in missing]
+        if at is None:
+            lines = ["[plex]"] + new + lines
+        else:
+            lines[at + 1:at + 1] = new
+    _write_in_place(path, "\n".join(lines) + "\n")
+
+
+def update_env(path: str, values: dict) -> None:
+    """Set KEY=value lines in an env file; a blank value removes the key."""
+    with open(path) as f:
+        lines = f.read().splitlines()
+    out, seen = [], set()
+    for line in lines:
+        m = re.match(r"^([A-Z_]+)=", line)
+        if m and m.group(1) in values:
+            seen.add(m.group(1))
+            if values[m.group(1)] == "":
+                continue
+            line = f"{m.group(1)}={values[m.group(1)]}"
+        out.append(line)
+    out += [f"{k}={v}" for k, v in values.items() if k not in seen and v != ""]
+    _write_in_place(path, "\n".join(out) + "\n")
+
+
+def _write_in_place(path: str, text: str) -> None:
+    # In place rather than rename: the service user owns these files but not
+    # /etc/plex-precache itself.
+    with open(path, "r+") as f:
+        f.write(text)
+        f.truncate()
+
+
+def reload_config(cfg: Config) -> None:
+    fresh = Config(cfg.path)
+    cfg.__dict__.update(fresh.__dict__)
+
+
+def systemctl_restart(unit: str) -> bool:
+    """Needs the sudo rule install.sh adds; never prompts for a password."""
+    try:
+        return subprocess.run(["sudo", "-n", "systemctl", "restart", unit],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                              timeout=60).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def apply_prefetch_settings(cfg: Config, pf: "Prefetcher", form: dict) -> str:
+    values = validate_prefetch(form)
+    update_ini(cfg.path, values)
+    reload_config(cfg)
+    pf.ensure_workers()
+    return "Pre-cache settings saved and applied."
+
+
+def apply_mount_settings(cfg: Config, form: dict) -> str:
+    values = validate_mount(form)
+    if values["CACHE_PERCENT"]:
+        floor = parse_size(values["CACHE_MIN_FREE"]) or 0
+        values["CACHE_MAX_SIZE"] = size_from_percent(cfg.cache_dir, int(values["CACHE_PERCENT"]),
+                                                     floor)
+    update_env(cfg.mount_env, values)
+    # The prefetcher's pre-cache floor follows the mount's.
+    floor_gb = max(0, round((parse_size(values["CACHE_MIN_FREE"]) or 0) / 1024 / MB))
+    update_ini(cfg.path, {"min_free_gb": str(floor_gb)})
+    reload_config(cfg)
+    if form.get("restart") == "now":
+        if systemctl_restart("plex-cache-mount"):
+            return f"Cache settings saved (size {values['CACHE_MAX_SIZE']}) and the mount restarted."
+        return ("Cache settings saved, but the mount couldn't be restarted from here. "
+                "Run: sudo systemctl restart plex-cache-mount")
+    return (f"Cache settings saved (size {values['CACHE_MAX_SIZE']}). They apply the next time "
+            "the mount restarts.")
+
+
+def warm_path(cfg: Config, pf: "Prefetcher", rel: str) -> str:
+    """Queue a file or folder under the mount for pre-caching."""
+    root = read_env_file(cfg.mount_env).get("MOUNTPOINT") or ""
+    if not root:
+        raise SettingsError("Pre-caching a folder needs the cached mount set up.")
+    target = os.path.realpath(os.path.join(root, rel.strip().lstrip("/")))
+    if os.path.commonpath([target, os.path.realpath(root)]) != os.path.realpath(root):
+        raise SettingsError("That path is outside the media folder.")
+    if not os.path.exists(target):
+        raise SettingsError("Nothing found at that path.")
+    files = [target] if os.path.isfile(target) else list(itertools.islice(
+        (os.path.join(d, n) for d, _s, ns in os.walk(target) for n in sorted(ns)), 500))
+    for f in files:
+        pf.submit(f, prio=PRIO_MANUAL)
+    return f"Queued {len(files)} file(s) from {rel or '/'} for pre-caching."
+
+
+def render_settings(cfg: Config, token: str, msg: str | None, ok: bool) -> str:
+    e = html.escape
+    env = read_env_file(cfg.mount_env) if cfg.mount_env else {}
+    has_mount = bool(env)
+
+    def row(label: str, field: str, help_: str) -> str:
+        hint = f"<div class=muted>{e(help_)}</div>" if help_ else ""
+        return f"<label class=field><span>{e(label)}</span>{field}{hint}</label>"
+
+    current = {
+        "next_episodes": cfg.next_episodes, "next_episode_head_mb": cfg.next_episode_head // MB,
+        "on_deck": cfg.on_deck, "on_deck_limit": cfg.on_deck_limit,
+        "on_deck_head_mb": cfg.on_deck_head // MB, "workers": cfg.workers,
+        "poll_interval": int(cfg.poll_interval), "remember_hours": int(cfg.remember / 3600),
+    }
+    pre = ""
+    for key, label, kind, lo, hi, help_ in PREFETCH_FIELDS:
+        if kind == "bool":
+            field = (f"<input type=checkbox name={key}"
+                     f"{' checked' if current[key] else ''}>")
+        else:
+            field = (f"<input type=number name={key} min={lo} max={hi} required "
+                     f"value='{current[key]}'>")
+        pre += row(label, field, help_)
+    mount = ""
+    if has_mount:
+        for key, label, kind, help_ in MOUNT_FIELDS:
+            field = (f"<input name={key} value='{e(env.get(key, ''))}' "
+                     f"{'inputmode=numeric ' if kind == 'percent' else ''}"
+                     f"autocomplete=off spellcheck=false>")
+            mount += row(label, field, help_)
+    banner = (f"<p class='notice {'good' if ok else 'bad'}'>{e(msg)}</p>" if msg else "")
+    hidden = f"<input type=hidden name=token value='{token}'>"
+    mount_form = f"""
+<form method=post action=settings/mount class=panel>{hidden}
+<h3>Cache</h3>{mount}
+<label class=check><input type=checkbox name=restart value=now checked>
+Restart the mount now so changes apply (anything playing pauses for a few seconds)</label>
+<button>Save cache settings</button></form>
+<form method=post action=restart-mount class=inline>{hidden}
+<button>Restart mount only</button></form>""" if has_mount else ""
+    warm_form = f"""
+<form method=post action=warm class=panel>{hidden}<h3>Pre-cache now</h3>
+{row("Folder or file", "<input name=path placeholder='TV/Some Show/Season 1' autocomplete=off>",
+     "Path inside " + (env.get("MOUNTPOINT") or "the media folder") + ". Up to 500 files are queued.")}
+<button>Pre-cache</button></form>""" if has_mount else ""
+    return f"""<section id=settings><h2>Settings</h2>{banner}
+<form method=post action=settings/prefetch class=panel>{hidden}<h3>Pre-caching</h3>{pre}
+<button>Save pre-cache settings</button>
+<span class=muted>Applies immediately.</span></form>
+{mount_form}{warm_form}</section>"""
+
+
+SETTINGS_CSS = """
+#settings .panel{background:var(--card);border-radius:6px;padding:12px;margin:12px 0}
+#settings h3{font-size:15px;margin:0 0 8px}.field{display:block;margin:10px 0}
+.field span{display:block;font-weight:600;font-size:14px;margin-bottom:3px}
+.field input:not([type=checkbox]){font:inherit;padding:5px 8px;width:100%;max-width:260px;
+box-sizing:border-box;background:var(--bg);color:var(--fg);border:1px solid var(--line);
+border-radius:4px}.check{display:block;margin:10px 0;font-size:14px}
+#settings button{margin-top:6px}.inline{display:inline}
+.notice{padding:8px 12px;border-radius:6px;color:#fff}.notice.good{background:var(--good)}
+.notice.bad{background:var(--bad)}"""
+
+
 def start_status_server(cfg: Config, pf: Prefetcher) -> None:
+    token = secrets.token_urlsafe(24)  # CSRF token for the settings forms
+    last_msg: dict = {}
+
     class Handler(http.server.BaseHTTPRequestHandler):
+        def _send(self, body: bytes, ctype: str, status: int = 200) -> None:
+            self.send_response(status)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+
         def do_GET(self):
             data = status_data(cfg, pf)
             if self.path.rstrip("/").endswith("/api/status"):
-                body, ctype = json.dumps(data).encode(), "application/json"
-            else:
-                body, ctype = render_status(data).encode(), "text/html; charset=utf-8"
-            self.send_response(200)
-            self.send_header("Content-Type", ctype)
-            self.send_header("Content-Length", str(len(body)))
+                self._send(json.dumps(data).encode(), "application/json")
+                return
+            msg = last_msg.pop("text", None) if "saved=1" in self.path else None
+            ok = last_msg.pop("ok", True)
+            settings = render_settings(cfg, token, msg, ok) if cfg.path else ""
+            self._send(render_status(data, settings).encode(), "text/html; charset=utf-8")
+
+        def do_POST(self):
+            length = min(int(self.headers.get("Content-Length") or 0), 64 * 1024)
+            form = {k: v[-1] for k, v in urllib.parse.parse_qs(
+                self.rfile.read(length).decode("utf-8", "replace")).items()}
+            if not secrets.compare_digest(form.get("token", ""), token):
+                self._send(b"Stale or missing form token; reload the page.", "text/plain", 403)
+                return
+            action = self.path.split("?")[0].rstrip("/").rsplit("/", 2)[-2:]
+            try:
+                if action == ["settings", "prefetch"]:
+                    text = apply_prefetch_settings(cfg, pf, form)
+                elif action == ["settings", "mount"]:
+                    text = apply_mount_settings(cfg, form)
+                elif action[-1] == "restart-mount":
+                    text = ("Mount restarted." if systemctl_restart("plex-cache-mount") else
+                            "Couldn't restart the mount from here. "
+                            "Run: sudo systemctl restart plex-cache-mount")
+                elif action[-1] == "warm":
+                    text = warm_path(cfg, pf, form.get("path", ""))
+                else:
+                    self._send(b"Not found", "text/plain", 404)
+                    return
+                last_msg.update(text=text, ok=not text.startswith("Couldn't")
+                                and "couldn't" not in text)
+                log.info("web: %s", text)
+            except (SettingsError, OSError) as err:
+                last_msg.update(text=str(err), ok=False)
+            # Back to the page; relative so it works behind nginx's /plexcache/ prefix.
+            depth = self.path.split("?")[0].strip("/").count("/")
+            self.send_response(303)
+            self.send_header("Location", "../" * depth + "./?saved=1#settings")
             self.end_headers()
-            self.wfile.write(body)
 
         def log_message(self, *_args):
             pass

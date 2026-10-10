@@ -116,6 +116,28 @@ playback (or the file is fully cached). The page has a "What's normal?" section
 explaining each level and what to do about it. The same data, including the
 grades, is at `/plexcache/api/status` as JSON.
 
+#### Settings from the web page
+
+The bottom of the status page has a **Settings** section:
+
+- **Pre-caching** (applies immediately): upcoming episodes, how much of each to
+  cache, Continue Watching warm-up, downloads at once, and how often to check
+  Plex.
+- **Cache** (restarts the mount, so playback pauses for a few seconds): cache
+  size as a fixed amount or a % of usable disk, disk to keep free, how long
+  unwatched files are kept, read-ahead and RAM buffer per stream. There's
+  also a restart-only button.
+- **Pre-cache now**: queue a folder or file under the media folder, such as a
+  season you're about to watch (up to 500 files at a time).
+
+The Plex token, remote and mount location stay command-line only. To make the
+page work, the installer gives the service user ownership of
+`/etc/plex-precache/config.ini` and `rclone-mount.env`. It also adds a sudo rule
+(`/etc/sudoers.d/plex-cache`) that lets that user run exactly
+`systemctl restart plex-cache-mount` and `systemctl restart plex-precache`, and
+nothing else. Forms carry a per-run token, so other websites can't submit them
+through your browser, and every value is checked before it's written.
+
 `sudo box remove plexcache` (or `/opt/plex-precache/uninstall.sh`) removes it all;
 add `--purge` to the uninstall script to also delete the config and cached files.
 

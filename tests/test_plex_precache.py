@@ -202,5 +202,79 @@ class HealthTests(unittest.TestCase):
         self.assertIsNone(pp.parse_size("lots"))
 
 
+class SettingsTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.ini = os.path.join(self.tmp.name, "config.ini")
+        self.env = os.path.join(self.tmp.name, "env")
+        with open(self.ini, "w") as f:
+            f.write("[plex]\n# keep me\nnext_episodes = 1\n[path_map]\n/a = /b\n")
+        with open(self.env, "w") as f:
+            f.write("# comment\nCACHE_MAX_SIZE=16G\nCACHE_PERCENT=60\n")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_update_ini_keeps_comments_and_sections(self):
+        pp.update_ini(self.ini, {"next_episodes": "3", "workers": "2"})
+        text = open(self.ini).read()
+        self.assertIn("# keep me", text)
+        self.assertIn("next_episodes = 3", text)
+        cfg = pp.Config(self.ini)
+        self.assertEqual((cfg.next_episodes, cfg.workers), (3, 2))
+        self.assertEqual(cfg.local_path("/a/x"), "/b/x")
+
+    def test_update_env_sets_and_removes(self):
+        pp.update_env(self.env, {"CACHE_MAX_SIZE": "20G", "CACHE_PERCENT": "", "READ_AHEAD": "1G"})
+        self.assertEqual(open(self.env).read(),
+                         "# comment\nCACHE_MAX_SIZE=20G\nREAD_AHEAD=1G\n")
+
+    def test_validation_rejects_bad_and_injected_values(self):
+        good = {"next_episodes": "2", "next_episode_head_mb": "0", "on_deck_limit": "5",
+                "on_deck_head_mb": "512", "workers": "2", "poll_interval": "10",
+                "remember_hours": "12"}
+        self.assertEqual(pp.validate_prefetch(good)["on_deck"], "false")
+        with self.assertRaises(pp.SettingsError):
+            pp.validate_prefetch(dict(good, workers="0"))
+        mount = {"CACHE_MAX_SIZE": "20g", "CACHE_PERCENT": "", "CACHE_MIN_FREE": "10G",
+                 "CACHE_MAX_AGE": "72h", "READ_AHEAD": "1G", "BUFFER_SIZE": "128M"}
+        self.assertEqual(pp.validate_mount(mount)["CACHE_MAX_SIZE"], "20G")
+        for bad in ({"CACHE_MAX_SIZE": "20G\nEVIL=1"}, {"CACHE_MAX_AGE": "3 days"},
+                    {"CACHE_PERCENT": "150"}, {"CACHE_MAX_SIZE": ""}):
+            with self.assertRaises(pp.SettingsError):
+                pp.validate_mount(dict(mount, **bad))
+        self.assertEqual(pp.validate_mount(dict(mount, CACHE_MAX_SIZE="", CACHE_PERCENT="50"))
+                         ["CACHE_PERCENT"], "50")
+
+    def test_worker_count_changes_live(self):
+        cfg = pp.Config(None)
+        cfg.workers = 3
+        pf = pp.Prefetcher(cfg)
+        pf.ensure_workers()
+        self.assertEqual(pf.n_workers, 3)
+        cfg.workers = 1
+        pf.ensure_workers()
+        for _ in range(40):
+            if pf.n_workers == 1:
+                break
+            pp.time.sleep(0.05)
+        self.assertEqual(pf.n_workers, 1)
+        pf.shutdown()
+
+    def test_warm_path_stays_inside_mount(self):
+        media = os.path.join(self.tmp.name, "media", "Show")
+        os.makedirs(media)
+        open(os.path.join(media, "e1.mkv"), "wb").close()
+        with open(self.env, "a") as f:
+            f.write(f"MOUNTPOINT={os.path.dirname(media)}\n")
+        cfg = pp.Config(None)
+        cfg.mount_env, cfg.cache_dir = self.env, ""
+        pf = pp.Prefetcher(cfg)
+        self.assertIn("Queued 1", pp.warm_path(cfg, pf, "Show"))
+        for bad in ("../", "/../../etc", "Show/../../.."):
+            with self.assertRaises(pp.SettingsError):
+                pp.warm_path(cfg, pf, bad)
+
+
 if __name__ == "__main__":
     unittest.main()
