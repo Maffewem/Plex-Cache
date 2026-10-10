@@ -131,8 +131,29 @@ sudo ./install.sh --with-mount --min-free 15G        # disk always kept free (de
 sudo plex-cache-resize 25G              # later: fixed size
 sudo plex-cache-resize --percent 70     # later: re-measure the disk and size by %
 sudo plex-cache-resize --min-free 15G   # later: change the floor
-plex-cache-resize --show                # current size, floor, disk free, cache usage
+sudo plex-cache-resize --max-age 7d     # later: drop files unwatched for 7 days (default 72h)
+plex-cache-resize --show                # current size, floor, expiry, disk free, cache usage
 ```
+
+### How the cache clears itself
+
+rclone handles this:
+
+- **By age.** Files nobody has read for `CACHE_MAX_AGE` (72h by default) are
+  deleted.
+- **By space.** When the cache passes `CACHE_MAX_SIZE`, or free disk drops below
+  `CACHE_MIN_FREE`, the least recently read files are deleted first, until
+  it's back under the limits.
+- **Streams are protected.** Files that are open are never evicted. That covers
+  anything Plex is playing and anything the prefetcher is reading. A next
+  episode that has just been cached was read recently, so it's among the last
+  to go.
+- **No pre-caching into a full disk.** The prefetcher won't start a
+  next-episode or On Deck download that would take free disk below
+  `min_free_gb`.
+
+rclone checks these limits every minute, so the cache can briefly run over
+them. It can also stay over while the open files alone exceed the limit.
 
 Percent sizing counts what's already in the cache as available, so re-running
 it doesn't shrink the cache just because the cache has filled up. Resizing
