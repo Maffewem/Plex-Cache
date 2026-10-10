@@ -56,6 +56,41 @@ queued /mnt/remote/tv/Show/S01E03.mkv from 0 MB (prio 1)
 cached /mnt/remote/tv/Show/S01E02.mkv: 3188 MB in 270s (11.8 MB/s)
 ```
 
+### Coming from SSHFS
+
+SSHFS can't keep a disk cache. Its `cache=yes` and `kernel_cache` options only
+cache directory listings and whatever happens to stay in RAM, so most reads
+still cross the WAN. The installer can switch you to rclone's SFTP backend,
+which uses the same server, SSH key and path, and mounts at the same place so
+your Plex libraries don't change.
+
+Take the values from your current SSHFS command. For
+`sshfs ... -o IdentityFile=~/.ssh/hostname username@serverIP:/home/username/data/ /data`:
+
+```bash
+sudo box install rclone
+sudo ./install.sh --sftp username@serverIP:/home/username/data \
+     --ssh-key /root/.ssh/hostname --mountpoint /data --replace-sshfs
+sudo systemctl enable --now plex-precache
+```
+
+Use the full path of the key (`~` above is the home folder of whoever ran
+SSHFS, usually `/root`), and add `--ssh-port` if the server isn't on 22.
+
+The installer copies the key to `/etc/plex-precache/ssh_key` and writes an
+rclone config in `/etc/plex-precache/` without touching yours. It checks
+that rclone can list the remote **before** changing anything. With
+`--replace-sshfs` it then comments the SSHFS line out of `/etc/fstab` (keeping
+a dated backup), unmounts SSHFS, and starts the cached mount at `/data`. Plex
+is stopped for those few seconds. Leave `--replace-sshfs` off to set
+everything up without swapping, and do the swap yourself later.
+
+To go back: `sudo systemctl disable --now plex-cache-mount`, restore
+`/etc/fstab` from the `/etc/fstab.plex-cache.*` backup, then `sudo mount -a`.
+
+If SSHFS is mounted by a script or service rather than fstab, disable that
+too, or it will try to mount over the new mount at boot.
+
 ### Swizzin panel and status page
 
 If the Swizzin panel is installed, the installer adds a **Plex-Cache** tile to it
@@ -119,7 +154,7 @@ matter:
 Without `--vfs-cache-mode full`, the prefetcher's reads aren't kept and it only
 wastes bandwidth.
 
-### Storage mounted over NFS or SMB instead?
+### Storage mounted over NFS or SMB?
 
 Either mount it through rclone instead (rclone has `sftp`, `smb` and other
 backends), or use the kernel's FS-Cache: `apt install cachefilesd`, set
