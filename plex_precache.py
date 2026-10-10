@@ -62,6 +62,7 @@ DEFAULTS = {
     "require_cache_mount": "true",
     "auto_update": "false",
     "stop_after_minutes": "10",
+    "taper_mb_s": "5",
 }
 
 # Lower number runs first.
@@ -103,6 +104,7 @@ class Config:
         self.require_cache_mount = s.getboolean("require_cache_mount")
         self.auto_update = s.getboolean("auto_update")
         self.stop_after = s.getfloat("stop_after_minutes") * 60
+        self.taper = s.getfloat("taper_mb_s") * MB
         # Longest prefix first so nested mappings win.
         self.path_map = sorted(cp["path_map"].items(), key=lambda kv: -len(kv[0]))
 
@@ -257,6 +259,7 @@ class Job:
         self.size = _size_or_zero(path)
         self.started_at: float | None = None
         self.rate = 0.0  # smoothed read speed, bytes/s
+        self.limit = 0.0  # bytes/s cap while nobody is watching; 0 = none
         self.lock = threading.Lock()
 
     def jump_to(self, offset: int) -> None:
@@ -286,7 +289,12 @@ def read_through(job: Job, block: int, stop: threading.Event) -> int:
             data = f.read(want)
             if not data:
                 break
-            speed = len(data) / max(time.monotonic() - t0, 1e-6)
+            took = time.monotonic() - t0
+            if job.limit > 0 and took < len(data) / job.limit:
+                # Slowed down: the viewer has gone, so leave the link for others.
+                stop.wait(len(data) / job.limit - took)
+                took = time.monotonic() - t0
+            speed = len(data) / max(took, 1e-6)
             with job.lock:
                 # A seek-ahead may have moved pos while we were reading.
                 if job.pos == pos:
@@ -434,25 +442,38 @@ class Prefetcher:
             self.last_seen[p] = now
 
     def stop_abandoned(self) -> None:
-        """Stop downloading for streams nobody has had open for stop_after_minutes.
+        """Slow, then stop, downloads for streams nobody has open any more.
 
         A paused stream still shows in Plex, so it keeps its downloads; this only
-        catches viewers who closed the player.
+        catches viewers who closed the player. From the first poll they're gone,
+        the download is capped at taper_mb_s, falling to nothing by
+        stop_after_minutes, so a viewer who switches to something else gets the
+        link. It stops at stop_after_minutes.
         """
-        if self.cfg.stop_after <= 0:
-            return
         now = time.time()
+        grace = max(2 * self.cfg.poll_interval, 15)
         with self.cv:
             jobs = [j for j in self.active.values() if j.owner and not j.cancelled]
             for job in jobs:
-                seen = self.last_seen.get(job.owner, job.created)
-                if now - seen >= self.cfg.stop_after:
+                gone = now - self.last_seen.get(job.owner, job.created)
+                if gone < grace:
+                    job.limit = 0.0
+                    continue
+                if self.cfg.stop_after > 0 and gone >= self.cfg.stop_after:
                     job.cancelled = True
                     del self.active[job.path]
                     log.info("stopped caching %s: nothing has played it for %.0f min",
-                             job.path, (now - seen) / 60)
+                             job.path, gone / 60)
                     self.recent.appendleft({"path": job.path, "mb": 0, "secs": 0,
                                             "at": now, "stopped": True})
+                    continue
+                if self.cfg.taper > 0:
+                    left = (1 - gone / self.cfg.stop_after) if self.cfg.stop_after > 0 else 1
+                    limit = max(self.cfg.taper * left, 256 * 1024)
+                    if not job.limit:
+                        log.info("slowing %s to %.1f MB/s: nobody is watching it",
+                                 job.path, limit / MB)
+                    job.limit = limit
             stale = now - max(self.cfg.stop_after, 3600)
             for p in [p for p, t in self.last_seen.items() if t < stale]:
                 del self.last_seen[p]
@@ -480,7 +501,8 @@ class Prefetcher:
                 "kind": {PRIO_PLAYING: "playing", PRIO_NEXT: "next episode",
                          PRIO_ON_DECK: "on deck", PRIO_MANUAL: "requested"}.get(
                              job.prio, str(job.prio)),
-                "state": "reading" if job.started_at else "queued",
+                "state": ("slowed, nobody watching" if job.limit else "reading")
+                         if job.started_at else "queued",
                 "percent": round(100 * min(1.0, max(0, pos - job.start) / span)),
                 "mb_s": (round((pos - job.start) / MB / max(1, time.time() - job.started_at), 1)
                          if job.started_at else None),
@@ -1112,6 +1134,9 @@ PREFETCH_FIELDS = [
     ("stop_after_minutes", "Stop downloading after nobody's watching for (min)", "int", 0, 240,
      "Once a stream is closed (not just paused) for this long, its download and upcoming "
      "episodes stop. 0 never stops."),
+    ("taper_mb_s", "...and meanwhile slow it to (MB/s)", "int", 0, 1000,
+     "Once nobody's watching, the download is capped at this and eases off to nothing by "
+     "the time it stops, leaving the link free if they start something else. 0 keeps full speed."),
     ("poll_interval", "Seconds between checks of Plex", "int", 2, 300, ""),
     ("remember_hours", "Hours before re-checking a cached file", "int", 0, 720,
      "Keep at or below the expiry below."),
@@ -1602,6 +1627,7 @@ def getattr_current(cfg: Config, key: str):
         "on_deck_head_mb": cfg.on_deck_head // MB, "workers": cfg.workers,
         "poll_interval": int(cfg.poll_interval), "remember_hours": int(cfg.remember / 3600),
         "stop_after_minutes": int(cfg.stop_after / 60),
+        "taper_mb_s": int(cfg.taper / MB),
     }[key]
 
 

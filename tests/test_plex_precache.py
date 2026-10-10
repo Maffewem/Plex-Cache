@@ -250,7 +250,7 @@ class SettingsTests(unittest.TestCase):
     def test_validation_rejects_bad_and_injected_values(self):
         good = {"next_episodes": "2", "next_episode_head_mb": "0", "on_deck_limit": "5",
                 "on_deck_head_mb": "512", "workers": "2", "poll_interval": "10",
-                "remember_hours": "12", "stop_after_minutes": "10"}
+                "remember_hours": "12", "stop_after_minutes": "10", "taper_mb_s": "5"}
         self.assertEqual(pp.validate_prefetch(good)["on_deck"], "false")
         with self.assertRaises(pp.SettingsError):
             pp.validate_prefetch(dict(good, workers="0"))
@@ -365,6 +365,35 @@ class StopAbandonedTests(unittest.TestCase):
             pf.last_seen[files["film"]] = now - 99999
             pf.stop_abandoned()
             self.assertIn(files["film"], pf.active)
+
+    def test_unwatched_downloads_taper_off(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "film")
+            with open(path, "wb") as f:
+                f.write(b"x" * 4 * pp.MB)
+            cfg = pp.Config(None)
+            cfg.stop_after, cfg.taper, cfg.poll_interval = 600, 10 * pp.MB, 10
+            pf = pp.Prefetcher(cfg)
+            pf.submit(path, owner=path)
+            job = pf.active[path]
+            now = pp.time.time()
+            pf.last_seen = {path: now}  # still on screen (or paused): full speed
+            pf.stop_abandoned()
+            self.assertEqual(job.limit, 0)
+            pf.last_seen = {path: now - 60}  # closed a minute ago: 90% of 10 MB/s
+            pf.stop_abandoned()
+            self.assertAlmostEqual(job.limit / pp.MB, 9.0, places=1)
+            pf.last_seen = {path: now - 540}  # nearly at the stop: 1 MB/s
+            pf.stop_abandoned()
+            self.assertAlmostEqual(job.limit / pp.MB, 1.0, places=1)
+            pf.last_seen = {path: now}  # back on screen: full speed again
+            pf.stop_abandoned()
+            self.assertEqual(job.limit, 0)
+            # The cap really slows reads: 4 MB at 8 MB/s takes about half a second.
+            job.limit = 8 * pp.MB
+            t0 = pp.time.monotonic()
+            self.assertEqual(pp.read_through(job, pp.MB, threading.Event()), 4 * pp.MB)
+            self.assertGreater(pp.time.monotonic() - t0, 0.4)
 
 
 class RecommendTests(unittest.TestCase):

@@ -275,6 +275,7 @@ FS-Cache has no read-ahead or size controls, so rclone is the better choice.
 | `remember_hours` | 12 | Skip files fully cached this recently |
 | `min_free_gb` | 10 | Skip next-episode/On Deck reads that would leave less free on `cache_dir`'s disk |
 | `stop_after_minutes` | 10 | Stop a download (and its upcoming episodes) once nothing has played it for this long; paused counts as playing; 0 = never |
+| `taper_mb_s` | 5 | Until then, cap those downloads at this many MB/s, easing off to nothing by the stop, so the link is free for whatever is watched next; 0 = full speed |
 | `status_port` | 8789 | Status page port on 127.0.0.1 (0 disables) |
 | `[path_map]` | | Translate Plex's paths if Plex sees a different path (Docker) |
 
