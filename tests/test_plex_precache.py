@@ -1,4 +1,5 @@
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -16,11 +17,13 @@ pp.DEFAULTS["require_cache_mount"] = "false"
 SESSIONS = """<MediaContainer size="2">
   <Video ratingKey="102" type="episode" grandparentRatingKey="100" grandparentTitle="Show"
          title="Ep 2" viewOffset="600000" duration="2400000">
-    <Media><Part file="/data/tv/Show/S01E02.mkv" size="4000000000"/></Media>
+    <Media bitrate="13333"><Part file="/data/tv/Show/S01E02.mkv" size="4000000000"/></Media>
     <Player state="playing"/>
+    <Session id="abc" bandwidth="14000" location="lan"/>
   </Video>
   <Video ratingKey="7" type="movie" title="Film" viewOffset="0" duration="6000000">
     <Media><Part file="/data/movies/Film.mkv" size="20000000000"/></Media>
+    <TranscodeSession speed="1.5" videoDecision="transcode" throttled="0"/>
   </Video>
 </MediaContainer>"""
 
@@ -42,6 +45,17 @@ class ParseTests(unittest.TestCase):
         self.assertEqual(s[0]["state"], "playing")
         self.assertEqual(s[1]["type"], "movie")
         self.assertIsNone(s[1]["state"])
+
+    def test_plex_delivery_rate(self):
+        direct, trans = pp.parse_sessions(ET.fromstring(SESSIONS))
+        self.assertEqual((direct["decision"], direct["send_kbps"]), ("direct play", 14000))
+        self.assertEqual(pp.plex_rate_text(direct, 1_666_000),
+                         "Plex: direct play, reading about 14 Mbps from the file, "
+                         "sending 14 Mbps to the player.")
+        self.assertEqual((trans["decision"], trans["transcode_speed"]), ("transcode", 1.5))
+        # A 1.5x transcode of a 2 MB/s (16 Mbps) file reads 24 Mbps.
+        self.assertEqual(pp.plex_rate_text(trans, 2_000_000),
+                         "Plex: transcode at 1.5x, reading about 24 Mbps from the file.")
 
     def test_next_episodes(self):
         files = pp.next_episode_files(ET.fromstring(LEAVES), "102", 2)
@@ -134,6 +148,9 @@ class StatusTests(unittest.TestCase):
             self.assertIn("&lt;i&gt;ep.mkv", page)
             self.assertIn("Show &amp; Co", page)
             self.assertIn("of 16G", page)
+            self.assertIn("<link rel=icon href=\"data:image/svg+xml,", page)
+            self.assertIn("id=theme", page)
+            self.assertIn("data-build=", page)
 
 
 def _stream(**kw):
@@ -237,7 +254,7 @@ class SettingsTests(unittest.TestCase):
     def test_validation_rejects_bad_and_injected_values(self):
         good = {"next_episodes": "2", "next_episode_head_mb": "0", "on_deck_limit": "5",
                 "on_deck_head_mb": "512", "workers": "2", "poll_interval": "10",
-                "remember_hours": "12", "stop_after_minutes": "10"}
+                "remember_hours": "12", "stop_after_minutes": "10", "taper_mb_s": "5"}
         self.assertEqual(pp.validate_prefetch(good)["on_deck"], "false")
         with self.assertRaises(pp.SettingsError):
             pp.validate_prefetch(dict(good, workers="0"))
@@ -352,6 +369,35 @@ class StopAbandonedTests(unittest.TestCase):
             pf.last_seen[files["film"]] = now - 99999
             pf.stop_abandoned()
             self.assertIn(files["film"], pf.active)
+
+    def test_unwatched_downloads_taper_off(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "film")
+            with open(path, "wb") as f:
+                f.write(b"x" * 4 * pp.MB)
+            cfg = pp.Config(None)
+            cfg.stop_after, cfg.taper, cfg.poll_interval = 600, 10 * pp.MB, 10
+            pf = pp.Prefetcher(cfg)
+            pf.submit(path, owner=path)
+            job = pf.active[path]
+            now = pp.time.time()
+            pf.last_seen = {path: now}  # still on screen (or paused): full speed
+            pf.stop_abandoned()
+            self.assertEqual(job.limit, 0)
+            pf.last_seen = {path: now - 60}  # closed a minute ago: 90% of 10 MB/s
+            pf.stop_abandoned()
+            self.assertAlmostEqual(job.limit / pp.MB, 9.0, places=1)
+            pf.last_seen = {path: now - 540}  # nearly at the stop: 1 MB/s
+            pf.stop_abandoned()
+            self.assertAlmostEqual(job.limit / pp.MB, 1.0, places=1)
+            pf.last_seen = {path: now}  # back on screen: full speed again
+            pf.stop_abandoned()
+            self.assertEqual(job.limit, 0)
+            # The cap really slows reads: 4 MB at 8 MB/s takes about half a second.
+            job.limit = 8 * pp.MB
+            t0 = pp.time.monotonic()
+            self.assertEqual(pp.read_through(job, pp.MB, threading.Event()), 4 * pp.MB)
+            self.assertGreater(pp.time.monotonic() - t0, 0.4)
 
 
 class RecommendTests(unittest.TestCase):
@@ -539,9 +585,15 @@ class RcloneSettingsTests(unittest.TestCase):
             page = pp.render_settings(self.cfg, "t", None, True)
         self.assertIn("action=switch/run", page)
         self.assertIn("Last switch: 2026-10-10 11:00 Test passed", page)
+        # On the cached mount there's nothing to do here; going back is CLI-only.
         with mock.patch.object(pp, "media_mount", lambda cfg: {
                 "where": self.mnt, "fstype": "fuse.rclone", "undo": True, "note": ""}):
-            self.assertIn("action=switch/back", pp.render_settings(self.cfg, "t", None, True))
+            page = pp.render_settings(self.cfg, "t", None, True)
+        self.assertNotIn("id=s-switch", page)
+        self.assertNotIn("switch/back", page)
+        with mock.patch.object(pp, "media_mount", lambda cfg: {
+                "where": self.mnt, "fstype": "", "undo": True, "note": ""}):
+            self.assertIn("isn't running", pp.render_settings(self.cfg, "t", None, True))
 
     def test_failed_restart_puts_old_files_back(self):
         with open(self.env) as f:
@@ -564,6 +616,14 @@ class RcloneSettingsTests(unittest.TestCase):
         with mock.patch.object(pp.subprocess, "run", no_sudo):
             self.assertEqual(self.real_restart({self.env: old}), "no-restart")
         self.assertIn("--nonsense", open(self.env).read())
+
+
+class VersionTests(unittest.TestCase):
+    def test_changelog_matches_version(self):
+        path = os.path.join(os.path.dirname(__file__), "..", "CHANGELOG.md")
+        with open(path) as f:
+            top = re.search(r"^## (\S+)", f.read(), re.M).group(1)
+        self.assertEqual(top, pp.__version__)
 
 
 if __name__ == "__main__":

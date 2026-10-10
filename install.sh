@@ -77,9 +77,11 @@ install -m 755 plex-cache-resize /usr/local/bin/plex-cache-resize
 install -m 755 plex-cache-update /usr/local/sbin/plex-cache-update
 install -m 755 plex-cache-switch /usr/local/sbin/plex-cache-switch
 for unit in plex-cache-update.service plex-cache-autoupdate.service plex-cache-autoupdate.timer \
-            plex-cache-switch.service plex-cache-switch-back.service; do
+            plex-cache-switch.service; do
   install -m 644 "systemd/$unit" "/etc/systemd/system/$unit"
 done
+# Removed in 1.3.0: the status page no longer offers going back to SSHFS.
+rm -f /etc/systemd/system/plex-cache-switch-back.service
 if git -C . rev-parse --git-dir >/dev/null 2>&1; then
   git -C . rev-parse --short=7 HEAD > /opt/plex-precache/VERSION
 fi
@@ -220,6 +222,10 @@ if [ -f /install/.panel.lock ] && [ -d /opt/swizzin/core ]; then
   if ! grep -q "BEGIN plex-cache" "$PROFILES"; then
     cat swizzin/plexcache_profile.py >> "$PROFILES"
   fi
+  sed -i '/# BEGIN plex-cache/,/# END plex-cache/s/img = "plex"$/img = "plexcache"/' "$PROFILES"
+  if [ -d /opt/swizzin/core/static/img/apps ]; then
+    install -m 644 swizzin/plexcache.png /opt/swizzin/core/static/img/apps/plexcache.png
+  fi
   chown swizzin: "$PROFILES" 2>/dev/null || true
   touch /install/.plexcache.lock
   systemctl restart panel 2>/dev/null || true
@@ -239,7 +245,7 @@ SUDOERS=/etc/sudoers.d/plex-cache
       echo "$RUN_USER ALL=(root) NOPASSWD: $bin restart $unit"
     done
     # The Update and SSHFS switch buttons; each service runs a fixed root-owned script.
-    for unit in plex-cache-update plex-cache-switch plex-cache-switch-back; do
+    for unit in plex-cache-update plex-cache-switch; do
       echo "$RUN_USER ALL=(root) NOPASSWD: $bin start --no-block $unit"
     done
   done

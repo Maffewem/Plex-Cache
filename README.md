@@ -87,8 +87,7 @@ line out of `/etc/fstab` (keeping a dated backup), stops Plex, unmounts SSHFS
 and starts the cached mount at the same place. If the cached mount doesn't come
 up showing your files, SSHFS is put back. Plex is always started again.
 
-To go back: **Go back to SSHFS** on the status page, or
-`sudo plex-cache-switch --back`. `box remove plexcache` also does this first.
+To go back: `sudo plex-cache-switch --back`. `box remove plexcache` also does this first.
 
 If SSHFS is mounted by a script or service rather than fstab, disable that
 too, or it will try to mount over the new mount at boot.
@@ -276,6 +275,7 @@ FS-Cache has no read-ahead or size controls, so rclone is the better choice.
 | `remember_hours` | 12 | Skip files fully cached this recently |
 | `min_free_gb` | 10 | Skip next-episode/On Deck reads that would leave less free on `cache_dir`'s disk |
 | `stop_after_minutes` | 10 | Stop a download (and its upcoming episodes) once nothing has played it for this long; paused counts as playing; 0 = never |
+| `taper_mb_s` | 5 | Until then, cap those downloads at this many MB/s, easing off to nothing by the stop, so the link is free for whatever is watched next; 0 = full speed |
 | `status_port` | 8789 | Status page port on 127.0.0.1 (0 disables) |
 | `[path_map]` | | Translate Plex's paths if Plex sees a different path (Docker) |
 

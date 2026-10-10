@@ -3,6 +3,16 @@
 The version is shown on the status page (`/plexcache/`) and by
 `python3 /opt/plex-precache/plex_precache.py --version`.
 
+## 1.3.0 (10 Oct 2026)
+
+- Each change now bumps the version number.
+- Removed the "Go back to SSHFS" button. `sudo plex-cache-switch --back` still works from SSH.
+- Each stream now shows how fast Plex is reading it, and whether it is transcoding.
+- Pre-caching slows down once nobody is watching, then stops. Set the speed under "...and meanwhile slow it to (MB/s)".
+- Refreshed the buttons and added a light/dark mode switch.
+- The page reloads by itself once an update finishes.
+- Added an icon for the browser tab and the Swizzin panel tile.
+
 ## 1.2.0 (10 Oct 2026)
 
 - Switch from SSHFS to a cached rclone SFTP mount from the status page or with

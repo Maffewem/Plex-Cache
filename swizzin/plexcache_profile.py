@@ -6,5 +6,5 @@ class plexcache_meta:
     baseurl = "/plexcache/"
     systemd = "plex-precache"
     check_theD = True
-    img = "plex"
+    img = "plexcache"
 # END plex-cache

@@ -36,7 +36,7 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 __released__ = "2026-10-10"
 
 log = logging.getLogger("plex-precache")
@@ -62,6 +62,7 @@ DEFAULTS = {
     "require_cache_mount": "true",
     "auto_update": "false",
     "stop_after_minutes": "10",
+    "taper_mb_s": "5",
 }
 
 # Lower number runs first.
@@ -103,6 +104,7 @@ class Config:
         self.require_cache_mount = s.getboolean("require_cache_mount")
         self.auto_update = s.getboolean("auto_update")
         self.stop_after = s.getfloat("stop_after_minutes") * 60
+        self.taper = s.getfloat("taper_mb_s") * MB
         # Longest prefix first so nested mappings win.
         self.path_map = sorted(cp["path_map"].items(), key=lambda kv: -len(kv[0]))
 
@@ -155,8 +157,52 @@ def parse_sessions(root: ET.Element) -> list[dict]:
             "duration": int(video.get("duration") or part.get("duration") or 0),
             "state": (video.find("./Player").get("state")
                       if video.find("./Player") is not None else None),
+            **_delivery(video),
         })
     return out
+
+
+def _num(value: str | None) -> float:
+    try:
+        return float(value or 0)
+    except ValueError:
+        return 0.0
+
+
+def _delivery(video: ET.Element) -> dict:
+    """How Plex is serving a session: direct play or transcode, and how fast."""
+    session, ts = video.find("./Session"), video.find("./TranscodeSession")
+    media = video.find("./Media")
+    decision = "direct play"
+    if ts is not None:
+        decision = ("transcode" if ts.get("videoDecision") == "transcode"
+                    else "direct stream")
+    return {
+        "decision": decision,
+        # kbps as Plex reports them; 0 when it doesn't say.
+        "send_kbps": _num(session.get("bandwidth") if session is not None else None),
+        "media_kbps": _num(media.get("bitrate") if media is not None else None),
+        "transcode_speed": _num(ts.get("speed") if ts is not None else None),
+        "throttled": ts is not None and ts.get("throttled") == "1",
+    }
+
+
+def plex_rate_text(s: dict, bitrate: float) -> str:
+    """'Plex: transcoding at 1.4x, reading about 34 Mbps' for the stream card."""
+    parts = [s.get("decision") or ""]
+    read = 0.0
+    if s.get("decision") == "transcode" and s.get("transcode_speed"):
+        parts[0] += (f" at {s['transcode_speed']:.1f}x"
+                     + (" (paused until the player needs more)" if s.get("throttled") else ""))
+        read = bitrate * s["transcode_speed"]
+    elif s.get("send_kbps"):
+        read = s["send_kbps"] * 1000 / 8
+    if read:
+        parts.append(f"reading about {_mbps(read)} from the file")
+    if s.get("send_kbps"):
+        parts.append(f"sending {_mbps(s['send_kbps'] * 1000 / 8)} to the player")
+    text = ", ".join(p for p in parts if p)
+    return f"Plex: {text}." if text else ""
 
 
 def next_episode_files(all_leaves: ET.Element, rating_key: str, count: int) -> list[str]:
@@ -213,6 +259,7 @@ class Job:
         self.size = _size_or_zero(path)
         self.started_at: float | None = None
         self.rate = 0.0  # smoothed read speed, bytes/s
+        self.limit = 0.0  # bytes/s cap while nobody is watching; 0 = none
         self.lock = threading.Lock()
 
     def jump_to(self, offset: int) -> None:
@@ -242,7 +289,12 @@ def read_through(job: Job, block: int, stop: threading.Event) -> int:
             data = f.read(want)
             if not data:
                 break
-            speed = len(data) / max(time.monotonic() - t0, 1e-6)
+            took = time.monotonic() - t0
+            if job.limit > 0 and took < len(data) / job.limit:
+                # Slowed down: the viewer has gone, so leave the link for others.
+                stop.wait(len(data) / job.limit - took)
+                took = time.monotonic() - t0
+            speed = len(data) / max(took, 1e-6)
             with job.lock:
                 # A seek-ahead may have moved pos while we were reading.
                 if job.pos == pos:
@@ -390,25 +442,38 @@ class Prefetcher:
             self.last_seen[p] = now
 
     def stop_abandoned(self) -> None:
-        """Stop downloading for streams nobody has had open for stop_after_minutes.
+        """Slow, then stop, downloads for streams nobody has open any more.
 
         A paused stream still shows in Plex, so it keeps its downloads; this only
-        catches viewers who closed the player.
+        catches viewers who closed the player. From the first poll they're gone,
+        the download is capped at taper_mb_s, falling to nothing by
+        stop_after_minutes, so a viewer who switches to something else gets the
+        link. It stops at stop_after_minutes.
         """
-        if self.cfg.stop_after <= 0:
-            return
         now = time.time()
+        grace = max(2 * self.cfg.poll_interval, 15)
         with self.cv:
             jobs = [j for j in self.active.values() if j.owner and not j.cancelled]
             for job in jobs:
-                seen = self.last_seen.get(job.owner, job.created)
-                if now - seen >= self.cfg.stop_after:
+                gone = now - self.last_seen.get(job.owner, job.created)
+                if gone < grace:
+                    job.limit = 0.0
+                    continue
+                if self.cfg.stop_after > 0 and gone >= self.cfg.stop_after:
                     job.cancelled = True
                     del self.active[job.path]
                     log.info("stopped caching %s: nothing has played it for %.0f min",
-                             job.path, (now - seen) / 60)
+                             job.path, gone / 60)
                     self.recent.appendleft({"path": job.path, "mb": 0, "secs": 0,
                                             "at": now, "stopped": True})
+                    continue
+                if self.cfg.taper > 0:
+                    left = (1 - gone / self.cfg.stop_after) if self.cfg.stop_after > 0 else 1
+                    limit = max(self.cfg.taper * left, 256 * 1024)
+                    if not job.limit:
+                        log.info("slowing %s to %.1f MB/s: nobody is watching it",
+                                 job.path, limit / MB)
+                    job.limit = limit
             stale = now - max(self.cfg.stop_after, 3600)
             for p in [p for p, t in self.last_seen.items() if t < stale]:
                 del self.last_seen[p]
@@ -436,7 +501,8 @@ class Prefetcher:
                 "kind": {PRIO_PLAYING: "playing", PRIO_NEXT: "next episode",
                          PRIO_ON_DECK: "on deck", PRIO_MANUAL: "requested"}.get(
                              job.prio, str(job.prio)),
-                "state": "reading" if job.started_at else "queued",
+                "state": ("slowed, nobody watching" if job.limit else "reading")
+                         if job.started_at else "queued",
                 "percent": round(100 * min(1.0, max(0, pos - job.start) / span)),
                 "mb_s": (round((pos - job.start) / MB / max(1, time.time() - job.started_at), 1)
                          if job.started_at else None),
@@ -679,7 +745,8 @@ def stream_health(s: dict, d: dict, now: float | None = None) -> dict:
         playhead = min(size, playhead + int(bitrate * (now - s.get("seen_at", now))))
     job = next((j for j in d["jobs"] if j["path"] == path), None)
     out = {"title": s.get("title") or os.path.basename(path), "state": s.get("state"),
-           "bitrate": bitrate, "file": os.path.basename(path), "ahead_s": None}
+           "bitrate": bitrate, "file": os.path.basename(path), "ahead_s": None,
+           "plex": plex_rate_text(s, bitrate)}
 
     if job is None and path in d.get("done", {}):
         level, msg = GOOD, "Fully cached: playing from local disk."
@@ -851,7 +918,8 @@ def render_status(d: dict, settings: str = "") -> str:
         f"{badge(s['level'])}</div><div class=muted>{e(s['file'])} · "
         f"{e(s['state'] or 'unknown')}"
         f"{' · ' + _mbps(s['bitrate']) + ' video' if s['bitrate'] else ''}</div>"
-        f"{bar(s['ahead_s'])}<p>{e(s['detail'])}</p></div>"
+        f"{bar(s['ahead_s'])}<p>{e(s['detail'])}</p>"
+        f"{'<p class=muted>' + e(s['plex']) + '</p>' if s.get('plex') else ''}</div>"
         for s in d["streams"]) or "<p class=muted>Nothing playing in Plex.</p>"
     checks = "".join(
         f"<tr><td class=k>{e(x['title'])}</td><td>{badge(x['level'])}</td><td>{e(x['detail'])}</td></tr>"
@@ -874,11 +942,12 @@ def render_status(d: dict, settings: str = "") -> str:
     if not d["streams"] and overall in (GOOD, INFO):
         verdict = "Nothing playing right now, and everything looks healthy."
     return f"""<!doctype html><html><head><meta charset=utf-8>
-<meta name=viewport content="width=device-width,initial-scale=1"><title>Plex-Cache</title><style>
-:root{{color-scheme:light dark;--bg:#fff;--fg:#1c1c1c;--muted:#666;--line:#ddd;--card:#f6f6f7;
---good:#1f8a4c;--warn:#b7791f;--bad:#c53030;--info:#4a6fa5}}
-@media (prefers-color-scheme:dark){{:root{{--bg:#16181d;--fg:#e6e6e6;--muted:#9a9a9a;
---line:#333;--card:#1f2228;--good:#3fb871;--warn:#e0a43a;--bad:#ef5b5b;--info:#7aa2e3}}}}
+<meta name=viewport content="width=device-width,initial-scale=1"><title>Plex-Cache</title>
+<link rel=icon href="{FAVICON}"><script>try{{var t=localStorage.getItem('plexcache-theme');
+if(t)document.documentElement.dataset.theme=t}}catch(e){{}}</script><style>
+:root{{color-scheme:light;--bg:#fff;--fg:#1c1c1c;--muted:#666;--line:#ddd;--card:#f6f6f7;--good:#1f8a4c;--warn:#b7791f;--bad:#c53030;--info:#4a6fa5;--accent:#e5a00d;--accent-fg:#1c1c1c;--btn:#ececef}}
+@media (prefers-color-scheme:dark){{:root:not([data-theme=light]){{color-scheme:dark;--bg:#16181d;--fg:#e6e6e6;--muted:#9a9a9a;--line:#333;--card:#1f2228;--good:#3fb871;--warn:#e0a43a;--bad:#ef5b5b;--info:#7aa2e3;--accent:#e5a00d;--accent-fg:#1c1c1c;--btn:#2a2e36}}}}
+:root[data-theme=dark]{{color-scheme:dark;--bg:#16181d;--fg:#e6e6e6;--muted:#9a9a9a;--line:#333;--card:#1f2228;--good:#3fb871;--warn:#e0a43a;--bad:#ef5b5b;--info:#7aa2e3;--accent:#e5a00d;--accent-fg:#1c1c1c;--btn:#2a2e36}}
 body{{background:var(--bg);color:var(--fg);font:15px system-ui,sans-serif;margin:0 auto;
 max-width:900px;padding:16px}}h1{{font-size:22px;margin:0}}h2{{font-size:16px;margin-top:28px}}
 table{{width:100%;border-collapse:collapse}}td,th{{text-align:left;padding:6px 8px;
@@ -896,7 +965,7 @@ var(--info);border-radius:6px;padding:10px 12px;margin:8px 0}}.card p{{margin:6p
 .verdict.bad{{color:var(--bad)}}.verdict.info{{color:var(--info)}}
 .bar{{height:6px;background:var(--line);border-radius:3px;margin-top:8px;overflow:hidden}}
 .bar i{{display:block;height:100%;background:var(--good)}}.card.warn .bar i{{background:var(--warn)}}
-.card.bad .bar i{{background:var(--bad)}}button{{font:inherit;font-size:13px;padding:3px 10px}}
+.card.bad .bar i{{background:var(--bad)}}button{{font:inherit;font-size:13px;font-weight:600;padding:7px 14px;border-radius:8px;border:1px solid var(--line);background:var(--btn);color:var(--fg);cursor:pointer;transition:filter .15s,border-color .15s}}button:hover{{filter:brightness(1.08);border-color:var(--muted)}}button:active{{transform:translateY(1px)}}button:disabled{{opacity:.55;cursor:default}}button:focus-visible{{outline:2px solid var(--accent);outline-offset:2px}}button.pri{{background:var(--accent);color:var(--accent-fg);border-color:var(--accent)}}#theme{{margin-left:auto;margin-right:8px;border-radius:999px;padding:5px 12px}}
 details{{margin-top:24px}}
 .live{{display:inline-flex;align-items:center;gap:8px;border:1px solid var(--line);
 background:var(--card);color:var(--fg);border-radius:999px;padding:5px 12px 5px 10px;
@@ -911,9 +980,9 @@ border:1px solid var(--line);border-radius:6px;padding:1px 6px;vertical-align:mi
 50%{{box-shadow:0 0 0 5px rgba(63,184,113,0)}}}}
 @media (prefers-reduced-motion:reduce){{.live.on .dot{{animation:none}}}}
 .scroll{{overflow-x:auto}}td.k{{white-space:nowrap}}
-td.k+td{{width:1%}}progress{{width:90px}}html,body{{overflow-x:hidden}}{SETTINGS_CSS}</style></head><body>
+td.k+td{{width:1%}}progress{{width:90px}}html,body{{overflow-x:hidden}}{SETTINGS_CSS}</style></head><body data-build='{e(installed_version())}'>
 <div class=row><h1>Plex-Cache <span class=ver>v{__version__}</span></h1>
-<button id=toggle class='live on' type=button aria-pressed=false
+<button id=theme type=button title="Switch light or dark mode">Auto</button><button id=toggle class='live on' type=button aria-pressed=false
 title="Pause or resume live updates"><span class=dot></span><b id=livetext>Live</b>
 <span class=sub id=updated></span></button></div>
 {'<nav class=tabs><a href="#status" data-tab=status>Status</a><a href="#settings" data-tab=settings>Settings</a></nav>' if settings else ''}
@@ -948,6 +1017,39 @@ with --warm before watching, lower the quality in Plex, or give the cache more d
 {settings}
 <script>
 (function () {{
+  // Light, dark, or follow the system.
+  var themeBtn = document.getElementById("theme"), root = document.documentElement;
+  var themes = ["", "light", "dark"], names = {{"": "Auto", light: "Light", dark: "Dark"}};
+  function showTheme() {{ themeBtn.textContent = (root.dataset.theme === "dark" ? "\u263E " : root.dataset.theme === "light" ? "\u2600 " : "\u25D0 ") + names[root.dataset.theme || ""]; }}
+  themeBtn.onclick = function () {{
+    var t = themes[(themes.indexOf(root.dataset.theme || "") + 1) % 3];
+    if (t) root.dataset.theme = t; else delete root.dataset.theme;
+    try {{ t ? localStorage.setItem("plexcache-theme", t) : localStorage.removeItem("plexcache-theme"); }} catch (e) {{}}
+    showTheme();
+  }};
+  showTheme();
+  // After "Update now", wait for the new build to come up, then reload.
+  var build = document.body.dataset.build;
+  document.querySelectorAll("form[action='update/run']").forEach(function (f) {{
+    f.addEventListener("submit", function () {{
+      try {{ sessionStorage.setItem("plexcache-updating", JSON.stringify({{from: build, at: Date.now()}})); }} catch (e) {{}}
+    }});
+  }});
+  var waiting = null;
+  try {{ waiting = JSON.parse(sessionStorage.getItem("plexcache-updating") || "null"); }} catch (e) {{}}
+  if (waiting && waiting.from !== build) {{
+    try {{ sessionStorage.removeItem("plexcache-updating"); }} catch (e) {{}}
+  }} else if (waiting) {{
+    var poll = setInterval(function () {{
+      if (Date.now() - waiting.at > 180000) {{
+        clearInterval(poll); try {{ sessionStorage.removeItem("plexcache-updating"); }} catch (e) {{}}
+        return;
+      }}
+      fetch("api/status", {{cache: "no-store"}}).then(function (r) {{ return r.json(); }})
+        .then(function (d) {{ if (d.build && d.build !== waiting.from) location.reload(); }})
+        .catch(function () {{}});  // the page restarts during the update
+    }}, 3000);
+  }}
   var paused = false, last = Date.now(), failed = false;
   try {{ paused = localStorage.getItem("plexcache-paused") === "1"; }} catch (e) {{}}
   var btn = document.getElementById("toggle"), upd = document.getElementById("updated"),
@@ -1066,6 +1168,9 @@ PREFETCH_FIELDS = [
     ("stop_after_minutes", "Stop downloading after nobody's watching for (min)", "int", 0, 240,
      "Once a stream is closed (not just paused) for this long, its download and upcoming "
      "episodes stop. 0 never stops."),
+    ("taper_mb_s", "...and meanwhile slow it to (MB/s)", "int", 0, 1000,
+     "Once nobody's watching, the download is capped at this and eases off to nothing by "
+     "the time it stops, leaving the link free if they start something else. 0 keeps full speed."),
     ("poll_interval", "Seconds between checks of Plex", "int", 2, 300, ""),
     ("remember_hours", "Hours before re-checking a cached file", "int", 0, 720,
      "Keep at or below the expiry below."),
@@ -1556,11 +1661,16 @@ def getattr_current(cfg: Config, key: str):
         "on_deck_head_mb": cfg.on_deck_head // MB, "workers": cfg.workers,
         "poll_interval": int(cfg.poll_interval), "remember_hours": int(cfg.remember / 3600),
         "stop_after_minutes": int(cfg.stop_after / 60),
+        "taper_mb_s": int(cfg.taper / MB),
     }[key]
 
 
 UPDATE_REPO = "https://github.com/Maffewem/Plex-Cache"
 INSTALL_DIR = "/opt/plex-precache"
+
+
+# Browser tab icon (same picture as assets/plexcache.svg).
+FAVICON = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%231f2228'/%3E%3Cpath d='M14 18l18 14-18 14z' fill='%23e5a00d'/%3E%3Crect x='36' y='18' width='14' height='6' rx='2' fill='%23e5a00d' opacity='.55'/%3E%3Crect x='36' y='29' width='14' height='6' rx='2' fill='%23e5a00d' opacity='.8'/%3E%3Crect x='36' y='40' width='14' height='6' rx='2' fill='%23e5a00d'/%3E%3C/svg%3E"
 
 
 def installed_version() -> str:
@@ -1691,19 +1801,17 @@ def switch_check() -> str:
     return lines[-1] if lines else "Test passed."
 
 
-def start_switch(back: bool) -> str:
-    unit = "plex-cache-switch-back" if back else "plex-cache-switch"
+def start_switch() -> str:
     try:
-        ok = subprocess.run(["sudo", "-n", "systemctl", "start", "--no-block", unit],
+        ok = subprocess.run(["sudo", "-n", "systemctl", "start", "--no-block", "plex-cache-switch"],
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                             timeout=30).returncode == 0
     except (OSError, subprocess.TimeoutExpired):
         ok = False
     if not ok:
-        raise SettingsError("Couldn't start it from here. Run: sudo plex-cache-switch"
-                            + (" --back" if back else ""))
-    return ("Going back to SSHFS" if back else "Switching to the cached mount") + \
-        (". Plex pauses for a moment. Reload this page in a minute to see how it went.")
+        raise SettingsError("Couldn't start it from here. Run: sudo plex-cache-switch")
+    return ("Switching to the cached mount. Plex pauses for a moment. Reload this page in a "
+            "minute to see how it went.")
 
 
 def set_auto_update(cfg: Config, form: dict) -> str:
@@ -1783,7 +1891,7 @@ def render_settings(cfg: Config, token: str, msg: str | None, ok: bool,
 <form method=post action=settings/mount>{hidden}{mount}
 <label class=check><input type=checkbox name=restart value=now checked>
 Restart the mount now so changes apply (anything playing pauses for a few seconds)</label>
-<button>Save cache settings</button></form>
+<button class=pri>Save cache settings</button></form>
 <form method=post action=restart-mount class=inline>{hidden}
 <button>Restart mount only</button></form></div>""" if has_mount else ""
     conn_form = ""
@@ -1806,7 +1914,7 @@ Restart the mount now so changes apply (anything playing pauses for a few second
 {row("New SSH private key", "<textarea name=key rows=3 placeholder='Leave blank to keep the current key' spellcheck=false></textarea>",
      "Only needed if the server's key changed. Paste it again when saving after a test.")}
 <button name=do value=test>Test connection</button>
-<button name=do value=save>Test and save</button>
+<button class=pri name=do value=save>Test and save</button>
 <p class=muted>Saving tests the connection first and changes nothing if it fails. It then
 restarts the mount, so anything playing pauses for a few seconds; if the mount won't start,
 the previous settings are put back.</p></form>"""
@@ -1827,23 +1935,20 @@ The switch reads the server, folder and SSH key from the SSHFS mount, checks rcl
 same folders, then swaps the mounts. Plex paths don't change. Plex pauses for a moment, and if
 the new mount doesn't show your files, SSHFS is put back.</p>
 <form method=post action=switch/check class=inline>{hidden}<button>Test first</button></form>
-<form method=post action=switch/run class=inline>{hidden}<button>Switch now</button></form>
+<form method=post action=switch/run class=inline>{hidden}<button class=pri>Switch now</button></form>
 {note_html}</div>"""
-    elif mm and mm["undo"]:
+    elif mm and mm["undo"] and mm["fstype"] != "fuse.rclone":
+        # Only worth a panel when something is wrong; going back to SSHFS is
+        # left to the command line (sudo plex-cache-switch --back).
         switch_form = f"""
-<div class=panel id=s-switch><h3>Media mount</h3>
-<p>{e(mm["where"])} {"is the cached rclone mount." if mm["fstype"] == "fuse.rclone" else
-  "should be the cached rclone mount, but it isn't running, so Plex sees no media. Check "
-  "<code>journalctl -u plex-cache-mount</code>, or go back to SSHFS."}</p>
-<form method=post action=switch/back>{hidden}
-<button>Go back to SSHFS</button>
-<span class=muted>Plex pauses for a moment, and pre-caching stops until you switch again.</span>
-</form>{note_html}</div>"""
+<div class='panel badbox' id=s-switch><h3>Media mount</h3>
+<p>{e(mm["where"])} should be the cached rclone mount, but it isn't running, so Plex sees no
+media. Check <code>journalctl -u plex-cache-mount</code>.</p>{note_html}</div>"""
     warm_form = f"""
 <form method=post action=warm class=panel id=s-warm>{hidden}<h3>Pre-cache now</h3>
 {row("Folder or file", "<input name=path placeholder='TV/Some Show/Season 1' autocomplete=off>",
      "Path inside " + (env.get("MOUNTPOINT") or "the media folder") + ". Up to 500 files are queued.")}
-<button>Pre-cache</button></form>""" if has_mount else ""
+<button class=pri>Pre-cache</button></form>""" if has_mount else ""
     rec_form = f"""
 <form method=post action=settings/recommended class='panel recbox' id=s-rec>{hidden}
 <h3>Recommended settings</h3>
@@ -1854,7 +1959,7 @@ stream, drop files after {e(rec["mount"]["CACHE_MAX_AGE"])} unwatched,
 {e(rec["prefetch"]["next_episodes"])} upcoming episode(s), {e(rec["prefetch"]["workers"])}
 download(s) at once.</p>
 {'<label class=check><input type=checkbox name=restart value=now checked> Restart the mount now (anything playing pauses for a few seconds)</label>' if has_mount else ''}
-<button>Use recommended settings</button></form>""" if rec else ""
+<button class=pri>Use recommended settings</button></form>""" if rec else ""
     note = last_update_note()
     update_form = f"""
 <div class=panel id=s-update><h3>Updates</h3>
@@ -1862,7 +1967,7 @@ download(s) at once.</p>
 <span class=muted>· build {e(installed_version())}</span>
 {('<br><span class=muted>Last update: ' + e(note) + '</span>') if note else ''}</p>
 <form method=post action=update/check class=inline>{hidden}<button>Check for updates</button></form>
-<form method=post action=update/run class=inline>{hidden}<button>Update now</button></form>
+<form method=post action=update/run class=inline>{hidden}<button class=pri>Update now</button></form>
 <form method=post action=update/auto>{hidden}
 <label class=check><input type=checkbox name=auto_update{' checked' if cfg.auto_update else ''}
 onchange="this.form.submit()"> Install updates automatically each night</label>
@@ -1871,7 +1976,7 @@ onchange="this.form.submit()"> Install updates automatically each night</label>
 <a href="{UPDATE_REPO}/blob/main/CHANGELOG.md" target=_blank rel=noopener>What's new</a></p></div>"""
     return f"""<section id=settings><h2>Settings</h2>{banner}{rec_form}
 <form method=post action=settings/prefetch class=panel id=s-prefetch>{hidden}<h3>Pre-caching</h3>{pre}
-<button>Save pre-cache settings</button>
+<button class=pri>Save pre-cache settings</button>
 <span class=muted>Applies immediately.</span></form>
 {switch_form}{conn_form}{mount_form}{warm_form}{update_form}</section>"""
 
@@ -1912,7 +2017,7 @@ cursor:pointer;margin:0!important;padding:0}.notice.good{background:var(--good)}
 PANEL_FOR_ACTION = {
     "settings/prefetch": "s-prefetch", "settings/mount": "s-mount", "restart-mount": "s-mount",
     "settings/connection": "s-conn", "settings/recommended": "s-rec", "warm": "s-warm",
-    "switch/check": "s-switch", "switch/run": "s-switch", "switch/back": "s-switch",
+    "switch/check": "s-switch", "switch/run": "s-switch",
     "update/check": "s-update", "update/run": "s-update", "update/auto": "s-update",
 }
 
@@ -1933,6 +2038,7 @@ def start_status_server(cfg: Config, pf: Prefetcher) -> None:
         def do_GET(self):
             data = status_data(cfg, pf)
             if self.path.rstrip("/").endswith("/api/status"):
+                data = dict(data, build=installed_version())
                 self._send(json.dumps(data).encode(), "application/json")
                 return
             msg = last_msg.pop("text", None) if "saved=1" in self.path else None
@@ -1966,9 +2072,7 @@ def start_status_server(cfg: Config, pf: Prefetcher) -> None:
                 elif action == ["switch", "check"]:
                     text = switch_check()
                 elif action == ["switch", "run"]:
-                    text = start_switch(back=False)
-                elif action == ["switch", "back"]:
-                    text = start_switch(back=True)
+                    text = start_switch()
                 elif action == ["update", "check"]:
                     text = check_for_update()
                 elif action == ["update", "run"]:
