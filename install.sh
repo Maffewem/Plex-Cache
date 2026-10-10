@@ -8,6 +8,12 @@
 #   sudo ./install.sh --with-mount --cache-percent 70   # % of free disk (default 60)
 #   sudo ./install.sh --with-mount --min-free 15G       # disk to always keep free (default 10G)
 #
+# Coming from an SSHFS mount? Point rclone at the same server, key and path:
+#   sudo ./install.sh --sftp user@host:/home/user/data --ssh-key /root/.ssh/hostname \
+#        --mountpoint /data [--ssh-port 22] [--replace-sshfs]
+# --replace-sshfs also unmounts the SSHFS mount, comments it out of /etc/fstab
+# (backup kept) and starts the cached mount in its place, so Plex paths don't change.
+#
 # Re-running is safe and keeps your config. Change the size later with plex-cache-resize.
 set -euo pipefail
 
@@ -17,6 +23,7 @@ RUN_USER=""
 CACHE_SIZE=""
 CACHE_PERCENT=""
 MIN_FREE=""
+SFTP="" SSH_KEY="" SSH_PORT=22 MOUNT_AT="" REPLACE_SSHFS=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --with-mount) WITH_MOUNT=1 ;;
@@ -24,13 +31,23 @@ while [ $# -gt 0 ]; do
     --cache-size) CACHE_SIZE="$2"; shift ;;
     --cache-percent) CACHE_PERCENT="$2"; shift ;;
     --min-free) MIN_FREE="$2"; shift ;;
-    -h|--help) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --sftp) SFTP="$2"; WITH_MOUNT=1; shift ;;
+    --ssh-key) SSH_KEY="$2"; shift ;;
+    --ssh-port) SSH_PORT="$2"; shift ;;
+    --mountpoint) MOUNT_AT="$2"; shift ;;
+    --replace-sshfs) REPLACE_SSHFS=1 ;;
+    -h|--help) sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 1 ;;
   esac
   shift
 done
 
 [ "$(id -u)" -eq 0 ] || { echo "run as root (sudo)" >&2; exit 1; }
+if [ -n "$SFTP" ]; then
+  case "$SFTP" in *@*:/*) ;; *) echo "--sftp must look like user@host:/path" >&2; exit 1 ;; esac
+  [ -n "$SSH_KEY" ] && [ -f "$SSH_KEY" ] || { echo "--sftp needs --ssh-key pointing at the key SSHFS uses" >&2; exit 1; }
+fi
+[ "$REPLACE_SSHFS" -eq 0 ] || [ -n "$SFTP" ] || { echo "--replace-sshfs needs --sftp" >&2; exit 1; }
 command -v python3 >/dev/null || { echo "python3 is required" >&2; exit 1; }
 
 if [ -z "$RUN_USER" ]; then
@@ -50,7 +67,7 @@ install -m 755 plex_precache.py uninstall.sh /opt/plex-precache/
 install -m 755 plex-cache-resize /usr/local/bin/plex-cache-resize
 
 if [ ! -f /etc/plex-precache/config.ini ]; then
-  install -m 640 -o root -g "$RUN_USER" config.example.ini /etc/plex-precache/config.ini
+  install -m 640 -o "$RUN_USER" -g "$RUN_USER" config.example.ini /etc/plex-precache/config.ini
   PREFS="/var/lib/plexmediaserver/Library/Application Support/Plex Media Server/Preferences.xml"
   if [ -f "$PREFS" ]; then
     TOKEN="$(grep -o 'PlexOnlineToken="[^"]*"' "$PREFS" | cut -d'"' -f2 || true)"
@@ -72,9 +89,64 @@ if [ "$WITH_MOUNT" -eq 1 ]; then
     sed "s|/home/USER/|/home/$RUN_USER/|" systemd/rclone-mount.env.example > /etc/plex-precache/rclone-mount.env
     NEW_ENV=1
   fi
+  set_env() {  # key value
+    if grep -q "^$1=" /etc/plex-precache/rclone-mount.env; then
+      sed -i "s|^$1=.*|$1=$2|" /etc/plex-precache/rclone-mount.env
+    else
+      echo "$1=$2" >> /etc/plex-precache/rclone-mount.env
+    fi
+  }
+  if [ -n "$SFTP" ]; then
+    # Same server, user, key and path as the SSHFS mount, but through rclone so
+    # reads land in the local cache. Kept in its own config, not the user's.
+    SFTP_USER="${SFTP%%@*}" REST="${SFTP#*@}"
+    SFTP_HOST="${REST%%:*}" SFTP_PATH="${REST#*:}"
+    install -m 600 -o "$RUN_USER" -g "$RUN_USER" "$SSH_KEY" /etc/plex-precache/ssh_key
+    KNOWN_HOSTS=""
+    for f in "$(dirname "$SSH_KEY")/known_hosts" /root/.ssh/known_hosts; do
+      if [ -f "$f" ] && { ssh-keygen -F "$SFTP_HOST" -f "$f" >/dev/null 2>&1 \
+                          || grep -qE "(^|,|\[)${SFTP_HOST}[],[:space:]]" "$f"; }; then
+        install -m 644 "$f" /etc/plex-precache/known_hosts
+        KNOWN_HOSTS="known_hosts_file = /etc/plex-precache/known_hosts"
+        break
+      fi
+    done
+    cat > /etc/plex-precache/rclone.conf <<RCONF
+[plexcache-sftp]
+type = sftp
+host = $SFTP_HOST
+user = $SFTP_USER
+port = $SSH_PORT
+key_file = /etc/plex-precache/ssh_key
+$KNOWN_HOSTS
+shell_type = unix
+md5sum_command = none
+sha1sum_command = none
+disable_hashcheck = true
+RCONF
+    chown "$RUN_USER": /etc/plex-precache/rclone.conf
+    chmod 600 /etc/plex-precache/rclone.conf
+    set_env REMOTE "plexcache-sftp:$SFTP_PATH"
+    set_env RCLONE_CONFIG /etc/plex-precache/rclone.conf
+    echo "rclone SFTP remote: $SFTP_USER@$SFTP_HOST:$SFTP_PATH (key copied to /etc/plex-precache/ssh_key)"
+    [ -n "$KNOWN_HOSTS" ] || echo "Note: no known_hosts entry for $SFTP_HOST found; rclone won't verify the host key." >&2
+  fi
+  [ -n "$MOUNT_AT" ] && set_env MOUNTPOINT "$MOUNT_AT"
+  # rclone 1.68+ can fetch one file over several connections at once, which is
+  # what a single 4K stream over a high-latency link needs.
+  if [ "$NEW_ENV" -eq 1 ]; then
+    RCLONE_VER="$(rclone version 2>/dev/null | sed -n 's/^rclone v\([0-9]*\)\.\([0-9]*\).*/\1 \2/p')"
+    if [ -n "$RCLONE_VER" ] && [ "${RCLONE_VER% *}" -ge 1 ] && \
+       { [ "${RCLONE_VER% *}" -gt 1 ] || [ "${RCLONE_VER#* }" -ge 68 ]; }; then
+      set_env EXTRA_ARGS "--vfs-read-chunk-streams 4"
+      echo "rclone ${RCLONE_VER/ /.}: downloading each file over 4 parallel streams."
+    fi
+  fi
   # shellcheck disable=SC1091
   . /etc/plex-precache/rclone-mount.env
-  install -d -o "$RUN_USER" -g "$RUN_USER" "$CACHE_DIR" "$MOUNTPOINT"
+  install -d -o "$RUN_USER" -g "$RUN_USER" "$CACHE_DIR"
+  # Never chown an existing mountpoint: it may be the live SSHFS mount.
+  [ -d "$MOUNTPOINT" ] || install -d -o "$RUN_USER" -g "$RUN_USER" "$MOUNTPOINT"
   grep -q '^user_allow_other' /etc/fuse.conf 2>/dev/null || echo user_allow_other >> /etc/fuse.conf
   sed "s/@USER@/$RUN_USER/g" systemd/plex-cache-mount.service > /etc/systemd/system/plex-cache-mount.service
 
@@ -91,7 +163,47 @@ if [ "$WITH_MOUNT" -eq 1 ]; then
   if [ ${#RESIZE[@]} -gt 0 ]; then
     PLEX_CACHE_ENV=/etc/plex-precache/rclone-mount.env /usr/local/bin/plex-cache-resize --no-restart "${RESIZE[@]}"
   fi
-  [ "$NEW_ENV" -eq 1 ] && echo "Edit /etc/plex-precache/rclone-mount.env (REMOTE, MOUNTPOINT) before starting the mount."
+  if [ -n "$SFTP" ] && [ "$NEW_ENV" -eq 1 ] && [ -z "$MOUNT_AT" ]; then
+    echo "Set MOUNTPOINT in /etc/plex-precache/rclone-mount.env to where Plex expects media."
+  elif [ -z "$SFTP" ] && [ "$NEW_ENV" -eq 1 ]; then
+    echo "Edit /etc/plex-precache/rclone-mount.env (REMOTE, MOUNTPOINT) before starting the mount."
+  fi
+
+  if [ -n "$SFTP" ]; then
+    systemctl daemon-reload
+    # Check the remote works before touching the live SSHFS mount.
+    if ! sudo -u "$RUN_USER" "$(command -v rclone)" --config /etc/plex-precache/rclone.conf lsf --max-depth 1 \
+         "$REMOTE" >/dev/null; then
+      echo "rclone can't list $REMOTE with that key; leaving SSHFS alone." >&2
+      exit 1
+    fi
+    echo "rclone can reach $REMOTE."
+    if [ "$(findmnt -n -o FSTYPE --target "$MOUNTPOINT" 2>/dev/null)" = "fuse.sshfs" ]; then
+      if [ "$REPLACE_SSHFS" -eq 1 ]; then
+        echo "Replacing the SSHFS mount at $MOUNTPOINT (Plex is paused for a moment)..."
+        # An fstab line that is active, mentions sshfs and mounts at $MOUNTPOINT.
+        AT="[[:space:]]${MOUNTPOINT%/}/?[[:space:]]"
+        if grep -E "^[^#]" /etc/fstab | grep -E "$AT" | grep -q sshfs; then
+          cp /etc/fstab "/etc/fstab.plex-cache.$(date +%Y%m%d%H%M%S)"
+          sed -i -E "\\|^[^#]|{/sshfs/{\\|${AT}|s|^|# disabled by Plex-Cache: |}}" /etc/fstab
+          echo "Commented the SSHFS line out of /etc/fstab (backup saved next to it)."
+        else
+          echo "Warning: no SSHFS line for $MOUNTPOINT in /etc/fstab. If a script or service" \
+               "mounts it at boot, disable that too or it will fight the new mount." >&2
+        fi
+        systemctl stop plexmediaserver 2>/dev/null || true
+        fusermount -uz "$MOUNTPOINT" 2>/dev/null || umount -l "$MOUNTPOINT"
+        chown "$RUN_USER": "$MOUNTPOINT"
+        systemctl enable --now plex-cache-mount
+        systemctl start plexmediaserver 2>/dev/null || true
+        echo "Cached mount is live at $MOUNTPOINT. To go back: systemctl disable --now" \
+             "plex-cache-mount, restore /etc/fstab from the backup, and mount -a."
+      else
+        echo "SSHFS is still mounted at $MOUNTPOINT. Re-run with --replace-sshfs to swap it" \
+             "for the cached mount, or unmount it yourself and run: systemctl enable --now plex-cache-mount"
+      fi
+    fi
+  fi
 fi
 
 # ---- Swizzin integration ------------------------------------------------------
@@ -129,6 +241,28 @@ if [ -f /install/.panel.lock ] && [ -d /opt/swizzin/core ]; then
   echo "Added Plex-Cache to the Swizzin panel."
 fi
 
+# The status page edits these, so the service user owns them (the directory
+# stays root's). It may restart only these two units, without a password.
+chown "$RUN_USER": /etc/plex-precache/config.ini
+chmod 640 /etc/plex-precache/config.ini
+[ -f /etc/plex-precache/rclone-mount.env ] && chown "$RUN_USER": /etc/plex-precache/rclone-mount.env
+SUDOERS=/etc/sudoers.d/plex-cache
+{
+  echo "# Lets the Plex-Cache status page apply settings. Added by Plex-Cache install.sh."
+  for unit in plex-cache-mount plex-precache; do
+    for bin in /usr/bin/systemctl /bin/systemctl; do
+      echo "$RUN_USER ALL=(root) NOPASSWD: $bin restart $unit"
+    done
+  done
+} > "$SUDOERS.tmp"
+chmod 440 "$SUDOERS.tmp"
+if command -v visudo >/dev/null && visudo -cf "$SUDOERS.tmp" >/dev/null; then
+  mv "$SUDOERS.tmp" "$SUDOERS"
+else
+  rm -f "$SUDOERS.tmp"
+  echo "Note: couldn't add the sudo rule; the status page can save settings but not restart the mount." >&2
+fi
+
 # Let `box remove plexcache` uninstall it.
 if [ -d /etc/swizzin/scripts/remove ]; then
   printf '#!/bin/bash\nexec /opt/plex-precache/uninstall.sh "$@"\n' > /etc/swizzin/scripts/remove/plexcache.sh
@@ -138,7 +272,7 @@ fi
 systemctl daemon-reload
 echo
 echo "Installed. Next:"
-[ "$WITH_MOUNT" -eq 1 ] && echo "  systemctl enable --now plex-cache-mount   # after editing rclone-mount.env"
+[ "$WITH_MOUNT" -eq 1 ] && [ "$REPLACE_SSHFS" -eq 0 ] && echo "  systemctl enable --now plex-cache-mount   # after editing rclone-mount.env"
 echo "  systemctl enable --now plex-precache"
 echo "  journalctl -fu plex-precache             # watch it work"
 echo "  plex-cache-resize --show                 # cache size and usage"

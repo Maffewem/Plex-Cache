@@ -4,6 +4,7 @@
 #   sudo plex-cache-resize 25G              # fixed cache size
 #   sudo plex-cache-resize --percent 70     # 70% of free disk after keeping --min-free spare
 #   sudo plex-cache-resize --min-free 15G   # change the spare-space floor (re-sizes if sized by percent)
+#   sudo plex-cache-resize --max-age 7d     # drop files not watched for this long (default 72h)
 #   sudo plex-cache-resize --show           # print current settings
 #
 # Add --no-restart to save the change without restarting the mount (it applies
@@ -12,7 +13,7 @@ set -euo pipefail
 
 ENV_FILE=${PLEX_CACHE_ENV:-/etc/plex-precache/rclone-mount.env}
 CONFIG=${PLEX_CACHE_CONFIG:-/etc/plex-precache/config.ini}
-SIZE="" PERCENT="" MIN_FREE="" RESTART=1 SHOW=0
+SIZE="" PERCENT="" MIN_FREE="" MAX_AGE="" RESTART=1 SHOW=0
 
 usage() { sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; }
 
@@ -20,6 +21,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --percent) PERCENT="$2"; shift ;;
     --min-free) MIN_FREE="$2"; shift ;;
+    --max-age) MAX_AGE="$2"; shift ;;
     --no-restart) RESTART=0 ;;
     --show) SHOW=1 ;;
     -h|--help) usage; exit 0 ;;
@@ -55,13 +57,23 @@ if [ "$SHOW" -eq 1 ]; then
   echo "Cache dir:      $CACHE_DIR"
   echo "Cache max size: $CACHE_MAX_SIZE"
   echo "Keep free:      $CACHE_MIN_FREE"
+  echo "Expire after:   $CACHE_MAX_AGE unwatched"
   echo "Disk free now:  $(df -h --output=avail "$CACHE_DIR" | tail -1 | tr -d ' ')"
   echo "In cache now:   $(du -sh "$CACHE_DIR" 2>/dev/null | cut -f1)"
   exit 0
 fi
 
 [ "$(id -u)" -eq 0 ] || { echo "run as root (sudo)" >&2; exit 1; }
-[ -n "$SIZE$PERCENT$MIN_FREE" ] || { usage >&2; exit 1; }
+[ -n "$SIZE$PERCENT$MIN_FREE$MAX_AGE" ] || { usage >&2; exit 1; }
+
+if [ -n "$MAX_AGE" ]; then
+  case "$MAX_AGE" in
+    *[0-9][smhdwMy]) ;;
+    *) echo "--max-age takes an rclone duration such as 12h, 3d or 2w" >&2; exit 1 ;;
+  esac
+  set_env CACHE_MAX_AGE "$MAX_AGE"
+  echo "Files unwatched for $MAX_AGE will be dropped from the cache"
+fi
 
 if [ -n "$MIN_FREE" ]; then
   set_env CACHE_MIN_FREE "$MIN_FREE"

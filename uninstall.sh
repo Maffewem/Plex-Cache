@@ -29,7 +29,7 @@ if [ -f "$PROFILES" ] && grep -q "BEGIN plex-cache" "$PROFILES"; then
   systemctl restart panel 2>/dev/null
 fi
 rm -f /install/.plexcache.lock /etc/swizzin/scripts/remove/plexcache.sh
-rm -f /usr/local/bin/plex-cache-resize
+rm -f /usr/local/bin/plex-cache-resize /etc/sudoers.d/plex-cache
 rm -rf /opt/plex-precache
 
 if [ "$PURGE" -eq 1 ]; then

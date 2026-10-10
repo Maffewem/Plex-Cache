@@ -8,6 +8,9 @@ import xml.etree.ElementTree as ET
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import plex_precache as pp  # noqa: E402
 
+# Tests read local temp files, which are not a caching mount.
+pp.DEFAULTS["require_cache_mount"] = "false"
+
 SESSIONS = """<MediaContainer size="2">
   <Video ratingKey="102" type="episode" grandparentRatingKey="100" grandparentTitle="Show"
          title="Ep 2" viewOffset="600000" duration="2400000">
@@ -129,6 +132,191 @@ class StatusTests(unittest.TestCase):
             self.assertIn("&lt;i&gt;ep.mkv", page)
             self.assertIn("Show &amp; Co", page)
             self.assertIn("of 16G", page)
+
+
+def _stream(**kw):
+    s = {"title": "Ep", "file": "/m/e.mkv", "path": "/m/e.mkv", "state": "playing",
+         "size": 3600 * 1_000_000, "duration": 3600 * 1000,  # 1 MB/s video
+         "view_offset": 600 * 1000, "seen_at": 1000.0}
+    s.update(kw)
+    return s
+
+
+def _data(jobs=(), done=None, warned=()):
+    return {"jobs": list(jobs), "done": done or {}, "warned": list(warned)}
+
+
+def _job(pos, rate, state="reading"):
+    return {"path": "/m/e.mkv", "pos": pos, "rate": rate, "state": state}
+
+
+class HealthTests(unittest.TestCase):
+    def health(self, s, d):
+        return pp.stream_health(s, d, now=1000.0)
+
+    def test_fully_cached_is_good(self):
+        h = self.health(_stream(), _data(done={"/m/e.mkv": 1}))
+        self.assertEqual(h["level"], pp.GOOD)
+        self.assertAlmostEqual(h["ahead_s"], 3000)
+
+    def test_well_ahead_and_fast_is_good(self):
+        h = self.health(_stream(), _data([_job(1200 * 1_000_000, 3_000_000)]))
+        self.assertEqual(h["level"], pp.GOOD)
+        self.assertIn("10 min cached ahead", h["detail"])
+
+    def test_slow_link_is_bad_with_time_left(self):
+        h = self.health(_stream(), _data([_job(900 * 1_000_000, 500_000)]))
+        self.assertEqual(h["level"], pp.BAD)
+        self.assertIn("runs out in about 10 min", h["detail"])
+
+    def test_overtaken_is_bad(self):
+        h = self.health(_stream(), _data([_job(100 * 1_000_000, 3_000_000)]))
+        self.assertEqual(h["level"], pp.BAD)
+
+    def test_marginal_link_and_short_lead_are_warn(self):
+        self.assertEqual(self.health(_stream(), _data([_job(900 * 1_000_000, 1_200_000)]))["level"],
+                         pp.WARN)
+        self.assertEqual(self.health(_stream(), _data([_job(610 * 1_000_000, 3_000_000)]))["level"],
+                         pp.WARN)
+        self.assertEqual(self.health(_stream(), _data([_job(0, 0, "queued")]))["level"], pp.WARN)
+
+    def test_buffering_and_missing_file_are_bad(self):
+        h = self.health(_stream(state="buffering"), _data(done={"/m/e.mkv": 1}))
+        self.assertEqual(h["level"], pp.BAD)
+        self.assertEqual(self.health(_stream(), _data(warned=["/m/e.mkv"]))["level"], pp.BAD)
+
+    def test_system_checks(self):
+        gb = 1024 ** 3
+        d = {"poll_error": None, "last_poll": pp.time.time(), "poll_interval": 10,
+             "sessions": [{}], "jobs": [], "recent": [],
+             "streams": [{"bitrate": 2_500_000}],
+             "mem_available": 300 * 1024 ** 2,
+             "cache": {"disk": {"free": 5 * gb}, "min_free": 10 * gb, "used": 16 * gb,
+                       "mount": {"CACHE_MAX_SIZE": "16G", "BUFFER_SIZE": "128M"}}}
+        d["recent"] = [{"mb": 600, "secs": 600, "path": "x", "at": 0}]  # 1 MB/s
+        levels = {c["title"]: c["level"] for c in pp.system_checks(d)}
+        self.assertEqual(levels, {"Plex": pp.GOOD, "Disk space": pp.BAD,
+                                  "Cache size": pp.WARN, "Memory": pp.BAD,
+                                  "Link speed": pp.WARN})
+
+    def test_parse_size(self):
+        self.assertEqual(pp.parse_size("16G"), 16 * 1024 ** 3)
+        self.assertEqual(pp.parse_size("128M"), 128 * 1024 ** 2)
+        self.assertIsNone(pp.parse_size("lots"))
+
+
+class SettingsTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.ini = os.path.join(self.tmp.name, "config.ini")
+        self.env = os.path.join(self.tmp.name, "env")
+        with open(self.ini, "w") as f:
+            f.write("[plex]\n# keep me\nnext_episodes = 1\n[path_map]\n/a = /b\n")
+        with open(self.env, "w") as f:
+            f.write("# comment\nCACHE_MAX_SIZE=16G\nCACHE_PERCENT=60\n")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_update_ini_keeps_comments_and_sections(self):
+        pp.update_ini(self.ini, {"next_episodes": "3", "workers": "2"})
+        text = open(self.ini).read()
+        self.assertIn("# keep me", text)
+        self.assertIn("next_episodes = 3", text)
+        cfg = pp.Config(self.ini)
+        self.assertEqual((cfg.next_episodes, cfg.workers), (3, 2))
+        self.assertEqual(cfg.local_path("/a/x"), "/b/x")
+
+    def test_update_env_sets_and_removes(self):
+        pp.update_env(self.env, {"CACHE_MAX_SIZE": "20G", "CACHE_PERCENT": "", "READ_AHEAD": "1G"})
+        self.assertEqual(open(self.env).read(),
+                         "# comment\nCACHE_MAX_SIZE=20G\nREAD_AHEAD=1G\n")
+
+    def test_validation_rejects_bad_and_injected_values(self):
+        good = {"next_episodes": "2", "next_episode_head_mb": "0", "on_deck_limit": "5",
+                "on_deck_head_mb": "512", "workers": "2", "poll_interval": "10",
+                "remember_hours": "12"}
+        self.assertEqual(pp.validate_prefetch(good)["on_deck"], "false")
+        with self.assertRaises(pp.SettingsError):
+            pp.validate_prefetch(dict(good, workers="0"))
+        mount = {"CACHE_MAX_SIZE": "20g", "CACHE_PERCENT": "", "CACHE_MIN_FREE": "10G",
+                 "CACHE_MAX_AGE": "72h", "READ_AHEAD": "1G", "BUFFER_SIZE": "128M"}
+        self.assertEqual(pp.validate_mount(mount)["CACHE_MAX_SIZE"], "20G")
+        for bad in ({"CACHE_MAX_SIZE": "20G\nEVIL=1"}, {"CACHE_MAX_AGE": "3 days"},
+                    {"CACHE_PERCENT": "150"}, {"CACHE_MAX_SIZE": ""}):
+            with self.assertRaises(pp.SettingsError):
+                pp.validate_mount(dict(mount, **bad))
+        self.assertEqual(pp.validate_mount(dict(mount, CACHE_MAX_SIZE="", CACHE_PERCENT="50"))
+                         ["CACHE_PERCENT"], "50")
+
+    def test_worker_count_changes_live(self):
+        cfg = pp.Config(None)
+        cfg.workers = 3
+        pf = pp.Prefetcher(cfg)
+        pf.ensure_workers()
+        self.assertEqual(pf.n_workers, 3)
+        cfg.workers = 1
+        pf.ensure_workers()
+        for _ in range(40):
+            if pf.n_workers == 1:
+                break
+            pp.time.sleep(0.05)
+        self.assertEqual(pf.n_workers, 1)
+        pf.shutdown()
+
+    def test_warm_path_stays_inside_mount(self):
+        media = os.path.join(self.tmp.name, "media", "Show")
+        os.makedirs(media)
+        open(os.path.join(media, "e1.mkv"), "wb").close()
+        with open(self.env, "a") as f:
+            f.write(f"MOUNTPOINT={os.path.dirname(media)}\n")
+        cfg = pp.Config(None)
+        cfg.mount_env, cfg.cache_dir = self.env, ""
+        pf = pp.Prefetcher(cfg)
+        self.assertIn("Queued 1", pp.warm_path(cfg, pf, "Show"))
+        for bad in ("../", "/../../etc", "Show/../../.."):
+            with self.assertRaises(pp.SettingsError):
+                pp.warm_path(cfg, pf, bad)
+
+
+MOUNTS = """/dev/sda1 / ext4 rw,relatime 0 0
+user@1.2.3.4:/home/user/data /data fuse.sshfs rw,nosuid,user_id=0 0 0
+box:media /mnt/remote fuse.rclone rw,nosuid,user_id=1000 0 0
+srv:/x /mnt/my\\040nfs nfs4 rw,fsc,vers=4.2 0 0
+srv:/y /mnt/nfsplain nfs4 rw,vers=4.2 0 0
+"""
+
+
+class MountTests(unittest.TestCase):
+    def test_mount_detection(self):
+        self.assertEqual(pp.mount_info("/data/Movies/x.mkv", MOUNTS)[:2], ("/data", "fuse.sshfs"))
+        self.assertEqual(pp.mount_info("/database/x", MOUNTS)[:2], ("/", "ext4"))
+        self.assertEqual(pp.mount_info("/mnt/my nfs/a.mkv", MOUNTS)[:2], ("/mnt/my nfs", "nfs4"))
+        cached = {p: pp.caches_to_disk(*pp.mount_info(p, MOUNTS)[1:])
+                  for p in ("/data/a", "/mnt/remote/a", "/mnt/my nfs/a", "/mnt/nfsplain/a", "/x")}
+        self.assertEqual(cached, {"/data/a": False, "/mnt/remote/a": True, "/mnt/my nfs/a": True,
+                                  "/mnt/nfsplain/a": False, "/x": False})
+
+    def test_uncached_mount_blocks_prefetch_and_is_reported(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "a.mkv")
+            open(path, "wb").close()
+            cfg = pp.Config(None)
+            cfg.require_cache_mount = True
+            pf = pp.Prefetcher(cfg)
+            pf.submit(path)  # a temp dir is never an rclone mount
+            self.assertEqual(len(pf.queue), 0)
+            self.assertEqual(len(pf.blocked), 1)
+        s = {"file": "/data/a.mkv", "path": "/data/a.mkv", "state": "playing"}
+        d2 = {"jobs": [], "done": {}, "warned": [], "blocked": {"/data": "fuse.sshfs"}}
+        h = pp.stream_health(s, d2)
+        self.assertEqual(h["level"], pp.BAD)
+        self.assertIn("can't cache", h["detail"])
+        self.assertEqual(pp.stream_health(s, dict(d2, blocked={"/": "ext4"}))["level"], pp.GOOD)
+        d2.update(poll_error=None, last_poll=0, sessions=[], recent=[], streams=[],
+                  cache={"mount": {}})
+        titles = [c["title"] for c in pp.system_checks(d2)]
+        self.assertIn("Media mount", titles)
 
 
 if __name__ == "__main__":

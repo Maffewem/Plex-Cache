@@ -56,6 +56,48 @@ queued /mnt/remote/tv/Show/S01E03.mkv from 0 MB (prio 1)
 cached /mnt/remote/tv/Show/S01E02.mkv: 3188 MB in 270s (11.8 MB/s)
 ```
 
+### Coming from SSHFS
+
+SSHFS can't keep a disk cache. Its `cache=yes` and `kernel_cache` options only
+cache directory listings and whatever happens to stay in RAM, so most reads
+still cross the WAN. The installer can switch you to rclone's SFTP backend,
+which uses the same server, SSH key and path, and mounts at the same place so
+your Plex libraries don't change.
+
+Take the values from your current SSHFS command. For
+`sshfs ... -o IdentityFile=~/.ssh/hostname username@serverIP:/home/username/data/ /data`:
+
+```bash
+sudo box install rclone
+sudo ./install.sh --sftp username@serverIP:/home/username/data \
+     --ssh-key /root/.ssh/hostname --mountpoint /data --replace-sshfs
+sudo systemctl enable --now plex-precache
+```
+
+Use the full path of the key (`~` above is the home folder of whoever ran
+SSHFS, usually `/root`), and add `--ssh-port` if the server isn't on 22.
+
+The installer copies the key to `/etc/plex-precache/ssh_key` and writes an
+rclone config in `/etc/plex-precache/` without touching yours. It checks
+that rclone can list the remote **before** changing anything. With
+`--replace-sshfs` it then comments the SSHFS line out of `/etc/fstab` (keeping
+a dated backup), unmounts SSHFS, and starts the cached mount at `/data`. Plex
+is stopped for those few seconds. Leave `--replace-sshfs` off to set
+everything up without swapping, and do the swap yourself later.
+
+To go back: `sudo systemctl disable --now plex-cache-mount`, restore
+`/etc/fstab` from the `/etc/fstab.plex-cache.*` backup, then `sudo mount -a`.
+
+If SSHFS is mounted by a script or service rather than fstab, disable that
+too, or it will try to mount over the new mount at boot.
+
+The prefetcher refuses to run on SSHFS, and the status page says so. Reading
+ahead there stores nothing locally and only competes with Plex for the same
+SSH connection. SSHFS also funnels everything through one connection, so a
+high-latency link tops out at a few MB/s, which is less than a 4K remux needs.
+On rclone 1.68 and later the installer adds `--vfs-read-chunk-streams 4`, so
+each file is fetched over several connections at once.
+
 ### Swizzin panel and status page
 
 If the Swizzin panel is installed, the installer adds a **Plex-Cache** tile to it
@@ -65,9 +107,43 @@ start/stop/restart controls as other apps. It uses the panel's
 
 If nginx is installed, the tile links to a status page at
 `https://<your server>/plexcache/`, behind the same login as your other apps.
-It shows what's playing, what is being cached and how fast, recently cached
-files, and how full the cache and disk are. The same data is at
-`/plexcache/api/status` as JSON.
+It updates itself every 5 seconds (with a pause button) and grades everything
+as **Good**, **Borderline** or **Struggling**, with a one-line reason:
+
+- **Each stream:** how many minutes are cached ahead of the playhead, and how
+  fast the link is downloading compared with the video's bitrate. If the link is
+  slower than the video, it estimates when the head start runs out. It also
+  flags Plex reporting a stream as buffering, or a file the box can't see.
+- **Health:** whether Plex is reachable, free disk against the floor, whether
+  the cache is full and evicting files, available RAM against the rclone
+  buffers, and recent link speed.
+
+"Good" means at least 2 minutes cached ahead and downloading 1.5x faster than
+playback (or the file is fully cached). The page has a "What's normal?" section
+explaining each level and what to do about it. The same data, including the
+grades, is at `/plexcache/api/status` as JSON.
+
+#### Settings from the web page
+
+The bottom of the status page has a **Settings** section:
+
+- **Pre-caching** (applies immediately): upcoming episodes, how much of each to
+  cache, Continue Watching warm-up, downloads at once, and how often to check
+  Plex.
+- **Cache** (restarts the mount, so playback pauses for a few seconds): cache
+  size as a fixed amount or a % of usable disk, disk to keep free, how long
+  unwatched files are kept, read-ahead and RAM buffer per stream. There's
+  also a restart-only button.
+- **Pre-cache now**: queue a folder or file under the media folder, such as a
+  season you're about to watch (up to 500 files at a time).
+
+The Plex token, remote and mount location stay command-line only. To make the
+page work, the installer gives the service user ownership of
+`/etc/plex-precache/config.ini` and `rclone-mount.env`. It also adds a sudo rule
+(`/etc/sudoers.d/plex-cache`) that lets that user run exactly
+`systemctl restart plex-cache-mount` and `systemctl restart plex-precache`, and
+nothing else. Forms carry a per-run token, so other websites can't submit them
+through your browser, and every value is checked before it's written.
 
 `sudo box remove plexcache` (or `/opt/plex-precache/uninstall.sh`) removes it all;
 add `--purge` to the uninstall script to also delete the config and cached files.
@@ -84,8 +160,29 @@ sudo ./install.sh --with-mount --min-free 15G        # disk always kept free (de
 sudo plex-cache-resize 25G              # later: fixed size
 sudo plex-cache-resize --percent 70     # later: re-measure the disk and size by %
 sudo plex-cache-resize --min-free 15G   # later: change the floor
-plex-cache-resize --show                # current size, floor, disk free, cache usage
+sudo plex-cache-resize --max-age 7d     # later: drop files unwatched for 7 days (default 72h)
+plex-cache-resize --show                # current size, floor, expiry, disk free, cache usage
 ```
+
+### How the cache clears itself
+
+rclone handles this:
+
+- **By age.** Files nobody has read for `CACHE_MAX_AGE` (72h by default) are
+  deleted.
+- **By space.** When the cache passes `CACHE_MAX_SIZE`, or free disk drops below
+  `CACHE_MIN_FREE`, the least recently read files are deleted first, until
+  it's back under the limits.
+- **Streams are protected.** Files that are open are never evicted. That covers
+  anything Plex is playing and anything the prefetcher is reading. A next
+  episode that has just been cached was read recently, so it's among the last
+  to go.
+- **No pre-caching into a full disk.** The prefetcher won't start a
+  next-episode or On Deck download that would take free disk below
+  `min_free_gb`.
+
+rclone checks these limits every minute, so the cache can briefly run over
+them. It can also stay over while the open files alone exceed the limit.
 
 Percent sizing counts what's already in the cache as available, so re-running
 it doesn't shrink the cache just because the cache has filled up. Resizing
@@ -107,7 +204,7 @@ matter:
 Without `--vfs-cache-mode full`, the prefetcher's reads aren't kept and it only
 wastes bandwidth.
 
-### Storage mounted over NFS or SMB instead?
+### Storage mounted over NFS or SMB?
 
 Either mount it through rclone instead (rclone has `sftp`, `smb` and other
 backends), or use the kernel's FS-Cache: `apt install cachefilesd`, set
