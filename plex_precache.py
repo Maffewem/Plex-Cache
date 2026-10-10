@@ -36,7 +36,7 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 __released__ = "2026-10-10"
 
 log = logging.getLogger("plex-precache")
