@@ -974,6 +974,26 @@ with --warm before watching, lower the quality in Plex, or give the cache more d
       last = Date.now(); failed = false; label();
     }}).catch(function () {{ failed = true; label(); }});
   }}
+  // Saving a setting reloads the page; come back to the same spot.
+  document.querySelectorAll("#settings form").forEach(function (f) {{
+    f.addEventListener("submit", function () {{
+      try {{ sessionStorage.setItem("plexcache-scroll", String(window.scrollY)); }} catch (e) {{}}
+    }});
+  }});
+  if (/[?&]saved=1/.test(location.search)) {{
+    var y = null;
+    try {{ y = sessionStorage.getItem("plexcache-scroll");
+           sessionStorage.removeItem("plexcache-scroll"); }} catch (e) {{}}
+    history.replaceState(null, "", location.pathname);
+    if (y !== null) {{
+      var back = function () {{ window.scrollTo(0, +y); }};
+      back(); window.addEventListener("load", back);  // after any jump to the #panel anchor
+    }}
+  }}
+  var toast = document.getElementById("toast");
+  if (toast && toast.classList.contains("good")) setTimeout(function () {{
+    toast.style.opacity = "0"; setTimeout(function () {{ toast.remove(); }}, 500);
+  }}, 6000);
   setInterval(refresh, 5000); setInterval(label, 1000); label();
 }})();
 </script></body></html>"""
@@ -1704,10 +1724,13 @@ def render_settings(cfg: Config, token: str, msg: str | None, ok: bool,
             field = (f"<input name={key} value='{e(value)}' "
                      f"autocomplete=off spellcheck=false>")
             mount += row(label, field, help_, key)
-    banner = (f"<p class='notice {'good' if ok else 'bad'}'>{e(msg)}</p>" if msg else "")
+    # Shown where you are rather than at the top, so saving doesn't lose your place.
+    banner = (f"<div id=toast class='notice toast {'good' if ok else 'bad'}' role=status>"
+              f"<span>{e(msg)}</span><button type=button aria-label=Close "
+              f"onclick=\"this.parentNode.remove()\">&times;</button></div>" if msg else "")
     hidden = f"<input type=hidden name=token value='{token}'>"
     mount_form = f"""
-<form method=post action=settings/mount class=panel>{hidden}
+<form method=post action=settings/mount class=panel id=s-mount>{hidden}
 <h3>Cache</h3>{mount}
 <label class=check><input type=checkbox name=restart value=now checked>
 Restart the mount now so changes apply (anything playing pauses for a few seconds)</label>
@@ -1723,7 +1746,7 @@ Restart the mount now so changes apply (anything playing pauses for a few second
             return row(label, f"<input name={name} value='{e(str(vals.get(name, '')))}' "
                        f"autocomplete=off spellcheck=false {extra}>", help_)
         conn_form = f"""
-<form method=post action=settings/connection class=panel>{hidden}
+<form method=post action=settings/connection class=panel id=s-conn>{hidden}
 <h3>Connection to your media server</h3>
 {inp("host", "Server", "Hostname or IP address of the server holding your media.")}
 {inp("user", "User", "")}
@@ -1739,7 +1762,7 @@ Restart the mount now so changes apply (anything playing pauses for a few second
 restarts the mount, so anything playing pauses for a few seconds; if the mount won't start,
 the previous settings are put back.</p></form>"""
     elif has_mount and env.get("REMOTE"):
-        conn_form = f"""<div class=panel><h3>Connection to your media server</h3>
+        conn_form = f"""<div class=panel id=s-conn><h3>Connection to your media server</h3>
 <p>rclone remote <code>{e(env["REMOTE"])}</code>, mounted at <code>{e(env.get("MOUNTPOINT", ""))}</code>.</p>
 <p class=muted>This remote was set up outside Plex-Cache, so it's changed with
 <code>rclone config</code>. To manage an SFTP connection here, run
@@ -1749,7 +1772,7 @@ the previous settings are put back.</p></form>"""
     note_html = (f"<p class=muted>Last switch: {e(mm['note'])}</p>" if mm and mm["note"] else "")
     if mm and mm["fstype"] == "fuse.sshfs":
         switch_form = f"""
-<div class='panel badbox'><h3>Switch {e(mm["where"])} from SSHFS to the cached mount</h3>
+<div class='panel badbox' id=s-switch><h3>Switch {e(mm["where"])} from SSHFS to the cached mount</h3>
 <p>Your media is on SSHFS, which can't keep anything on local disk, so pre-caching is paused.
 The switch reads the server, folder and SSH key from the SSHFS mount, checks rclone sees the
 same folders, then swaps the mounts. Plex paths don't change. Plex pauses for a moment, and if
@@ -1759,7 +1782,7 @@ the new mount doesn't show your files, SSHFS is put back.</p>
 {note_html}</div>"""
     elif mm and mm["undo"]:
         switch_form = f"""
-<div class=panel><h3>Media mount</h3>
+<div class=panel id=s-switch><h3>Media mount</h3>
 <p>{e(mm["where"])} {"is the cached rclone mount." if mm["fstype"] == "fuse.rclone" else
   "should be the cached rclone mount, but it isn't running, so Plex sees no media. Check "
   "<code>journalctl -u plex-cache-mount</code>, or go back to SSHFS."}</p>
@@ -1768,12 +1791,12 @@ the new mount doesn't show your files, SSHFS is put back.</p>
 <span class=muted>Plex pauses for a moment, and pre-caching stops until you switch again.</span>
 </form>{note_html}</div>"""
     warm_form = f"""
-<form method=post action=warm class=panel>{hidden}<h3>Pre-cache now</h3>
+<form method=post action=warm class=panel id=s-warm>{hidden}<h3>Pre-cache now</h3>
 {row("Folder or file", "<input name=path placeholder='TV/Some Show/Season 1' autocomplete=off>",
      "Path inside " + (env.get("MOUNTPOINT") or "the media folder") + ". Up to 500 files are queued.")}
 <button>Pre-cache</button></form>""" if has_mount else ""
     rec_form = f"""
-<form method=post action=settings/recommended class='panel recbox'>{hidden}
+<form method=post action=settings/recommended class='panel recbox' id=s-rec>{hidden}
 <h3>Recommended settings</h3>
 <p class=muted>Worked out from this server: {e(rec["basis"])}. Cache
 {e(rec["mount"]["CACHE_MAX_SIZE"])} (60% of usable disk), keep {e(rec["mount"]["CACHE_MIN_FREE"])}
@@ -1785,7 +1808,7 @@ download(s) at once.</p>
 <button>Use recommended settings</button></form>""" if rec else ""
     note = last_update_note()
     update_form = f"""
-<div class=panel><h3>Updates</h3>
+<div class=panel id=s-update><h3>Updates</h3>
 <p>Version <b>{e(version_label())}</b>
 <span class=muted>· build {e(installed_version())}</span>
 {('<br><span class=muted>Last update: ' + e(note) + '</span>') if note else ''}</p>
@@ -1798,7 +1821,7 @@ onchange="this.form.submit()"> Install updates automatically each night</label>
 <p class=muted>Updates keep all your settings. Over SSH: <code>sudo plex-cache-update</code>.
 <a href="{UPDATE_REPO}/blob/main/CHANGELOG.md" target=_blank rel=noopener>What's new</a></p></div>"""
     return f"""<section id=settings><h2>Settings</h2>{banner}{rec_form}
-<form method=post action=settings/prefetch class=panel>{hidden}<h3>Pre-caching</h3>{pre}
+<form method=post action=settings/prefetch class=panel id=s-prefetch>{hidden}<h3>Pre-caching</h3>{pre}
 <button>Save pre-cache settings</button>
 <span class=muted>Applies immediately.</span></form>
 {switch_form}{conn_form}{mount_form}{warm_form}{update_form}</section>"""
@@ -1816,8 +1839,22 @@ box-sizing:border-box;background:var(--bg);color:var(--fg);border:1px solid var(
 border-radius:4px}.check{display:block;margin:10px 0;font-size:14px}
 #settings button{margin-top:6px}.rec{color:var(--info);font-size:13px}
 .recbox{border-left:4px solid var(--info)}.badbox{border-left:4px solid var(--warn)}.inline{display:inline}
-.notice{padding:8px 12px;border-radius:6px;color:#fff}.notice.good{background:var(--good)}
+.notice{padding:8px 12px;border-radius:6px;color:#fff}
+.toast{position:fixed;left:50%;bottom:16px;transform:translateX(-50%);z-index:10;
+width:max-content;max-width:calc(100% - 32px);box-sizing:border-box;display:flex;gap:12px;
+align-items:flex-start;box-shadow:0 4px 16px rgba(0,0,0,.3);transition:opacity .4s}
+.toast button{background:none;border:0;color:#fff;font-size:18px;line-height:1;
+cursor:pointer;margin:0!important;padding:0}.notice.good{background:var(--good)}
 .notice.bad{background:var(--bad)}"""
+
+
+# Where the page lands after each form, when JavaScript can't restore the scroll position.
+PANEL_FOR_ACTION = {
+    "settings/prefetch": "s-prefetch", "settings/mount": "s-mount", "restart-mount": "s-mount",
+    "settings/connection": "s-conn", "settings/recommended": "s-rec", "warm": "s-warm",
+    "switch/check": "s-switch", "switch/run": "s-switch", "switch/back": "s-switch",
+    "update/check": "s-update", "update/run": "s-update", "update/auto": "s-update",
+}
 
 
 def start_status_server(cfg: Config, pf: Prefetcher) -> None:
@@ -1894,8 +1931,10 @@ def start_status_server(cfg: Config, pf: Prefetcher) -> None:
                 last_msg.update(text=str(err), ok=False)
             # Back to the page; relative so it works behind nginx's /plexcache/ prefix.
             depth = self.path.split("?")[0].strip("/").count("/")
+            anchor = PANEL_FOR_ACTION.get("/".join(action), PANEL_FOR_ACTION.get(action[-1],
+                                                                                  "settings"))
             self.send_response(303)
-            self.send_header("Location", "../" * depth + "./?saved=1#settings")
+            self.send_header("Location", "../" * depth + "./?saved=1#" + anchor)
             self.end_headers()
 
         def log_message(self, *_args):
