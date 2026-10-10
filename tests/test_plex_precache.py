@@ -370,6 +370,37 @@ class StopAbandonedTests(unittest.TestCase):
             pf.stop_abandoned()
             self.assertIn(files["film"], pf.active)
 
+    def test_played_episode_reads_whole_file_after_head(self):
+        with tempfile.TemporaryDirectory() as d:
+            ep = os.path.join(d, "ep2")
+            with open(ep, "wb") as f:
+                f.write(b"x" * 100)
+            pf = pp.Prefetcher(pp.Config(None))
+            # Queued as the next episode (start only), then it starts playing.
+            pf.submit(ep, end=10, prio=pp.PRIO_NEXT, owner="ep1")
+            pf.submit(ep, start=0, owner=ep)
+            job = pf.active[ep]
+            self.assertIsNone(job.end)
+            self.assertEqual((job.prio, job.owner), (pp.PRIO_PLAYING, ep))
+            # Start already cached and remembered: playing it still reads it all.
+            del pf.active[ep]
+            pf.queue.clear()
+            pf.heads[ep] = pp.time.time()
+            pf.submit(ep, end=10, prio=pp.PRIO_NEXT)
+            self.assertNotIn(ep, pf.active)
+            pf.submit(ep, owner=ep)
+            self.assertIsNone(pf.active[ep].end)
+
+    def test_music_sessions_are_picked_up(self):
+        root = pp.ET.fromstring(
+            '<MediaContainer><Track ratingKey="7" type="track" title="Song" '
+            'grandparentTitle="Band" duration="200000" viewOffset="1000">'
+            '<Media><Part file="/m/Band/song.flac" size="30000000"/></Media>'
+            '<Player state="playing"/></Track></MediaContainer>')
+        s = pp.parse_sessions(root)
+        self.assertEqual([(x["file"], x["type"], x["title"]) for x in s],
+                         [("/m/Band/song.flac", "track", "Band")])
+
     def test_unwatched_downloads_taper_off(self):
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "film")
