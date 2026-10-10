@@ -131,5 +131,76 @@ class StatusTests(unittest.TestCase):
             self.assertIn("of 16G", page)
 
 
+def _stream(**kw):
+    s = {"title": "Ep", "file": "/m/e.mkv", "path": "/m/e.mkv", "state": "playing",
+         "size": 3600 * 1_000_000, "duration": 3600 * 1000,  # 1 MB/s video
+         "view_offset": 600 * 1000, "seen_at": 1000.0}
+    s.update(kw)
+    return s
+
+
+def _data(jobs=(), done=None, warned=()):
+    return {"jobs": list(jobs), "done": done or {}, "warned": list(warned)}
+
+
+def _job(pos, rate, state="reading"):
+    return {"path": "/m/e.mkv", "pos": pos, "rate": rate, "state": state}
+
+
+class HealthTests(unittest.TestCase):
+    def health(self, s, d):
+        return pp.stream_health(s, d, now=1000.0)
+
+    def test_fully_cached_is_good(self):
+        h = self.health(_stream(), _data(done={"/m/e.mkv": 1}))
+        self.assertEqual(h["level"], pp.GOOD)
+        self.assertAlmostEqual(h["ahead_s"], 3000)
+
+    def test_well_ahead_and_fast_is_good(self):
+        h = self.health(_stream(), _data([_job(1200 * 1_000_000, 3_000_000)]))
+        self.assertEqual(h["level"], pp.GOOD)
+        self.assertIn("10 min cached ahead", h["detail"])
+
+    def test_slow_link_is_bad_with_time_left(self):
+        h = self.health(_stream(), _data([_job(900 * 1_000_000, 500_000)]))
+        self.assertEqual(h["level"], pp.BAD)
+        self.assertIn("runs out in about 10 min", h["detail"])
+
+    def test_overtaken_is_bad(self):
+        h = self.health(_stream(), _data([_job(100 * 1_000_000, 3_000_000)]))
+        self.assertEqual(h["level"], pp.BAD)
+
+    def test_marginal_link_and_short_lead_are_warn(self):
+        self.assertEqual(self.health(_stream(), _data([_job(900 * 1_000_000, 1_200_000)]))["level"],
+                         pp.WARN)
+        self.assertEqual(self.health(_stream(), _data([_job(610 * 1_000_000, 3_000_000)]))["level"],
+                         pp.WARN)
+        self.assertEqual(self.health(_stream(), _data([_job(0, 0, "queued")]))["level"], pp.WARN)
+
+    def test_buffering_and_missing_file_are_bad(self):
+        h = self.health(_stream(state="buffering"), _data(done={"/m/e.mkv": 1}))
+        self.assertEqual(h["level"], pp.BAD)
+        self.assertEqual(self.health(_stream(), _data(warned=["/m/e.mkv"]))["level"], pp.BAD)
+
+    def test_system_checks(self):
+        gb = 1024 ** 3
+        d = {"poll_error": None, "last_poll": pp.time.time(), "poll_interval": 10,
+             "sessions": [{}], "jobs": [], "recent": [],
+             "streams": [{"bitrate": 2_500_000}],
+             "mem_available": 300 * 1024 ** 2,
+             "cache": {"disk": {"free": 5 * gb}, "min_free": 10 * gb, "used": 16 * gb,
+                       "mount": {"CACHE_MAX_SIZE": "16G", "BUFFER_SIZE": "128M"}}}
+        d["recent"] = [{"mb": 600, "secs": 600, "path": "x", "at": 0}]  # 1 MB/s
+        levels = {c["title"]: c["level"] for c in pp.system_checks(d)}
+        self.assertEqual(levels, {"Plex": pp.GOOD, "Disk space": pp.BAD,
+                                  "Cache size": pp.WARN, "Memory": pp.BAD,
+                                  "Link speed": pp.WARN})
+
+    def test_parse_size(self):
+        self.assertEqual(pp.parse_size("16G"), 16 * 1024 ** 3)
+        self.assertEqual(pp.parse_size("128M"), 128 * 1024 ** 2)
+        self.assertIsNone(pp.parse_size("lots"))
+
+
 if __name__ == "__main__":
     unittest.main()

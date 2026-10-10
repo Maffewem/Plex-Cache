@@ -65,9 +65,21 @@ start/stop/restart controls as other apps. It uses the panel's
 
 If nginx is installed, the tile links to a status page at
 `https://<your server>/plexcache/`, behind the same login as your other apps.
-It shows what's playing, what is being cached and how fast, recently cached
-files, and how full the cache and disk are. The same data is at
-`/plexcache/api/status` as JSON.
+It updates itself every 5 seconds (with a pause button) and grades everything
+as **Good**, **Borderline** or **Struggling**, with a one-line reason:
+
+- **Each stream:** how many minutes are cached ahead of the playhead, and how
+  fast the link is downloading compared with the video's bitrate. If the link is
+  slower than the video, it estimates when the head start runs out. It also
+  flags Plex reporting a stream as buffering, or a file the box can't see.
+- **Health:** whether Plex is reachable, free disk against the floor, whether
+  the cache is full and evicting files, available RAM against the rclone
+  buffers, and recent link speed.
+
+"Good" means at least 2 minutes cached ahead and downloading 1.5x faster than
+playback (or the file is fully cached). The page has a "What's normal?" section
+explaining each level and what to do about it. The same data, including the
+grades, is at `/plexcache/api/status` as JSON.
 
 `sudo box remove plexcache` (or `/opt/plex-precache/uninstall.sh`) removes it all;
 add `--purge` to the uninstall script to also delete the config and cached files.

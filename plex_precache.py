@@ -189,6 +189,7 @@ class Job:
         self.start = start
         self.size = _size_or_zero(path)
         self.started_at: float | None = None
+        self.rate = 0.0  # smoothed read speed, bytes/s
         self.lock = threading.Lock()
 
     def jump_to(self, offset: int) -> None:
@@ -213,14 +214,17 @@ def read_through(job: Job, block: int, stop: threading.Event) -> int:
             if end is not None and pos >= end:
                 break
             want = block if end is None else min(block, end - pos)
+            t0 = time.monotonic()
             f.seek(pos)
             data = f.read(want)
             if not data:
                 break
+            speed = len(data) / max(time.monotonic() - t0, 1e-6)
             with job.lock:
                 # A seek-ahead may have moved pos while we were reading.
                 if job.pos == pos:
                     job.pos = pos + len(data)
+                job.rate = speed if not job.rate else 0.8 * job.rate + 0.2 * speed
             total += len(data)
     return total
 
@@ -325,6 +329,8 @@ class Prefetcher:
             span = max(1, (last or 0) - job.start)
             rows.append({
                 "path": job.path,
+                "pos": pos,
+                "rate": job.rate,
                 "kind": {PRIO_PLAYING: "playing", PRIO_NEXT: "next episode",
                          PRIO_ON_DECK: "on deck"}.get(job.prio, str(job.prio)),
                 "state": "reading" if job.started_at else "queued",
@@ -333,7 +339,9 @@ class Prefetcher:
                          if job.started_at else None),
             })
         polled, err = self.last_poll
-        return {"jobs": rows, "recent": list(self.recent), "sessions": self.sessions,
+        with self.cv:
+            done = dict(self.done)
+        return {"jobs": rows, "done": done, "warned": sorted(self.warned), "recent": list(self.recent), "sessions": self.sessions,
                 "last_poll": polled, "poll_error": err}
 
     def shutdown(self, *_args) -> None:
@@ -344,11 +352,13 @@ class Prefetcher:
 
 def poll_once(plex: Plex, cfg: Config, pf: Prefetcher) -> None:
     sessions = parse_sessions(plex.get("/status/sessions"))
-    pf.sessions = [{"title": s["title"], "state": s["state"], "file": s["file"]}
-                   for s in sessions]
     for s in sessions:
-        path = cfg.local_path(s["file"])
-        size = s["size"] or _size_or_zero(path)
+        s["path"] = cfg.local_path(s["file"])
+        s["size"] = s["size"] or _size_or_zero(s["path"])
+        s["seen_at"] = time.time()
+    pf.sessions = sessions
+    for s in sessions:
+        path, size = s["path"], s["size"]
         start = max(0, byte_offset(s["view_offset"], s["duration"], size) - cfg.seek_margin)
         pf.submit(path, start=start, prio=PRIO_PLAYING)
 
@@ -452,61 +462,333 @@ def status_data(cfg: Config, pf: Prefetcher) -> dict:
         "dir": cfg.cache_dir,
         "used": dir_usage(cfg.cache_dir) if cfg.cache_dir else None,
         "disk": disk,
-        "min_free_gb": cfg.min_free / 1024 / MB,
+        "min_free": cfg.min_free,
         "mount": {k: env.get(k) for k in ("REMOTE", "MOUNTPOINT", "CACHE_MAX_SIZE",
                                           "CACHE_MIN_FREE", "CACHE_MAX_AGE",
                                           "READ_AHEAD", "BUFFER_SIZE")},
     }
+    data["mem_available"] = mem_available()
+    data["poll_interval"] = cfg.poll_interval
+    data["streams"] = [stream_health(s, data) for s in data["sessions"]]
+    data["checks"] = system_checks(data)
+    levels = [x["level"] for x in data["streams"] + data["checks"]]
+    data["overall"] = max(levels, key=LEVELS.index) if levels else GOOD
     return data
+
+
+# --------------------------------------------------------------------------
+# Health grading for the status page
+
+GOOD, INFO, WARN, BAD = "good", "info", "warn", "bad"
+LEVELS = [INFO, GOOD, WARN, BAD]  # ascending severity
+
+# A stream is healthy when the cache is this many seconds ahead of playback...
+AHEAD_GOOD_S = 120
+AHEAD_WARN_S = 30
+# ...and the link downloads at least this many times faster than the video plays.
+SPEED_GOOD_RATIO = 1.5
+
+
+def parse_size(v: str | None) -> int | None:
+    """'16G' -> bytes. Accepts K/M/G/T suffixes, as rclone does."""
+    if not v:
+        return None
+    v = v.strip().upper().rstrip("B")
+    mult = {"K": 1024, "M": MB, "G": 1024 * MB, "T": 1024 ** 4}.get(v[-1:], 1)
+    try:
+        return int(float(v.rstrip("KMGT")) * mult)
+    except ValueError:
+        return None
+
+
+def mem_available() -> int | None:
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except OSError:
+        pass
+    return None
+
+
+def _mbps(bytes_per_s: float) -> str:
+    return f"{bytes_per_s * 8 / 1e6:.0f} Mbps"
+
+
+def _dur(secs: float) -> str:
+    secs = max(0, int(secs))
+    return f"{secs // 60} min" if secs >= 120 else f"{secs}s"
+
+
+def stream_health(s: dict, d: dict, now: float | None = None) -> dict:
+    """How far the cache is ahead of one Plex stream, and whether it can stay ahead."""
+    now = now or time.time()
+    path = s.get("path") or s["file"]
+    size, dur_ms = s.get("size") or 0, s.get("duration") or 0
+    bitrate = size / (dur_ms / 1000) if size and dur_ms else 0  # bytes/s of video
+    playhead = byte_offset(s.get("view_offset", 0), dur_ms, size)
+    if s.get("state") == "playing" and bitrate:
+        # Plex's offset is as old as our last poll; playback has moved on since.
+        playhead = min(size, playhead + int(bitrate * (now - s.get("seen_at", now))))
+    job = next((j for j in d["jobs"] if j["path"] == path), None)
+    out = {"title": s.get("title") or os.path.basename(path), "state": s.get("state"),
+           "bitrate": bitrate, "file": os.path.basename(path), "ahead_s": None}
+
+    if job is None and path in d.get("done", {}):
+        level, msg = GOOD, "Fully cached: playing from local disk."
+        out["ahead_s"] = (size - playhead) / bitrate if bitrate else None
+    elif job is not None and job["state"] == "queued":
+        level, msg = WARN, ("Waiting for a free worker; other downloads are using them. "
+                            "Plex is reading from remote meanwhile.")
+    elif job is not None:
+        ahead = job["pos"] - playhead
+        rate = job["rate"]
+        ahead_s = ahead / bitrate if bitrate else None
+        out["ahead_s"] = ahead_s
+        ratio = rate / bitrate if bitrate else None
+        speed = (f"downloading at {_mbps(rate)} for a {_mbps(bitrate)} video"
+                 if bitrate else f"downloading at {_mbps(rate)}")
+        if ahead < 0:
+            level, msg = BAD, ("Playback has overtaken the cache, so Plex is streaming "
+                               f"straight from remote ({speed}).")
+        elif ratio is not None and ratio < 1:
+            left = ahead / (bitrate - rate) if bitrate > rate else 0
+            level, msg = BAD, (f"Link is slower than the video ({speed}). "
+                               f"{_dur(ahead_s or 0)} cached ahead, which runs out in about "
+                               f"{_dur(left)}; expect buffering after that.")
+        elif ahead_s is not None and ahead_s < AHEAD_WARN_S:
+            level, msg = WARN, f"Only {_dur(ahead_s)} cached ahead so far ({speed})."
+        elif ratio is not None and ratio < SPEED_GOOD_RATIO:
+            level, msg = WARN, (f"{_dur(ahead_s or 0)} cached ahead, but the link is only "
+                                f"just faster than the video ({speed}).")
+        elif ahead_s is not None and ahead_s < AHEAD_GOOD_S:
+            level, msg = GOOD, (f"Building a head start: {_dur(ahead_s)} cached ahead, "
+                                f"{speed} ({ratio:.1f}x real time).")
+        else:
+            level, msg = GOOD, (f"{_dur(ahead_s or 0)} cached ahead, {speed}"
+                                + (f" ({ratio:.1f}x real time)." if ratio else "."))
+    elif path in d.get("warned", []):
+        level, msg = BAD, ("File isn't visible on this box, so it can't be cached. "
+                           "Check the mount and [path_map].")
+    else:
+        level, msg = INFO, "Just started; caching begins on the next check."
+
+    if s.get("state") == "buffering":
+        level, msg = BAD, "Plex reports this stream is buffering. " + msg
+    out.update(level=level, detail=msg)
+    return out
+
+
+def system_checks(d: dict) -> list[dict]:
+    checks = []
+    c, m = d["cache"], d["cache"]["mount"]
+
+    if d.get("poll_error"):
+        checks.append({"level": BAD, "title": "Plex",
+                       "detail": f"Can't reach Plex: {d['poll_error']}"})
+    elif not d.get("last_poll"):
+        checks.append({"level": INFO, "title": "Plex", "detail": "Not checked yet."})
+    elif time.time() - d["last_poll"] > 3 * d.get("poll_interval", 10) + 5:
+        checks.append({"level": WARN, "title": "Plex",
+                       "detail": "Last successful check was a while ago."})
+    else:
+        checks.append({"level": GOOD, "title": "Plex", "detail": "Connected."})
+
+    disk = c.get("disk")
+    if disk:
+        free, floor = disk["free"], c["min_free"]
+        if free < floor:
+            checks.append({"level": BAD, "title": "Disk space", "detail":
+                f"{_gb(free)} free, below the {_gb(floor)} floor. Next-episode caching is "
+                "paused and rclone is evicting files. Free up space or run "
+                "plex-cache-resize --min-free with a lower value."})
+        elif free < 2 * floor:
+            checks.append({"level": WARN, "title": "Disk space", "detail":
+                f"{_gb(free)} free; getting close to the {_gb(floor)} floor."})
+        else:
+            checks.append({"level": GOOD, "title": "Disk space",
+                           "detail": f"{_gb(free)} free."})
+
+    cap = parse_size(m.get("CACHE_MAX_SIZE"))
+    if cap and c.get("used") is not None:
+        pct = 100 * c["used"] / cap
+        if pct >= 95:
+            checks.append({"level": WARN, "title": "Cache size", "detail":
+                f"Full ({_gb(c['used'])} of {m['CACHE_MAX_SIZE']}). rclone is evicting the "
+                "least recently watched files, so rewatches may download again. "
+                "Normal on a small disk; plex-cache-resize can make it bigger."})
+        else:
+            checks.append({"level": GOOD, "title": "Cache size", "detail":
+                f"{_gb(c['used'])} of {m['CACHE_MAX_SIZE']} used ({pct:.0f}%)."})
+
+    mem = d.get("mem_available")
+    if mem is not None:
+        per_stream = parse_size(m.get("BUFFER_SIZE")) or 0
+        need = per_stream * max(1, len(d["sessions"]))
+        if mem < 512 * MB or mem < need:
+            checks.append({"level": BAD, "title": "Memory", "detail":
+                f"Only {_gb(mem)} available. rclone's {m.get('BUFFER_SIZE')} per-stream "
+                "buffers and Plex transcodes may be starved; lower BUFFER_SIZE."})
+        elif mem < 1024 * MB:
+            checks.append({"level": WARN, "title": "Memory",
+                           "detail": f"{_gb(mem)} available; running low."})
+        else:
+            checks.append({"level": GOOD, "title": "Memory",
+                           "detail": f"{_gb(mem)} available."})
+
+    rates = [j["rate"] for j in d["jobs"] if j["state"] == "reading" and j["rate"]]
+    rates += [r["mb"] * MB / r["secs"] for r in d["recent"][:5] if r["secs"] >= 5]
+    if rates:
+        best = max(rates)
+        top = max((s["bitrate"] for s in d.get("streams", []) if s["bitrate"]), default=0)
+        msg = f"Recent downloads from remote reached {_mbps(best)}."
+        level = INFO
+        if top and best < top:
+            level = WARN
+            msg += f" That's below the {_mbps(top)} needed to keep up with what's playing."
+        checks.append({"level": level, "title": "Link speed", "detail": msg})
+    return checks
 
 
 def _gb(n: int | None) -> str:
     return "?" if n is None else f"{n / 1024 / MB:.1f} GB"
 
 
+LEVEL_LABEL = {GOOD: "Good", INFO: "Info", WARN: "Borderline", BAD: "Struggling"}
+VERDICT = {
+    GOOD: "All good: streams are playing from cache.",
+    INFO: "Nothing to report.",
+    WARN: "Worth keeping an eye on.",
+    BAD: "Something is likely to cause buffering.",
+}
+
+
 def render_status(d: dict) -> str:
     e = html.escape
     c = d["cache"]
     m = c["mount"]
+
+    def badge(level: str) -> str:
+        return f"<span class='badge {level}'>{LEVEL_LABEL[level]}</span>"
+
+    def bar(ahead_s: float | None) -> str:
+        if ahead_s is None:
+            return ""
+        pct = max(0, min(100, 100 * ahead_s / (AHEAD_GOOD_S * 5)))
+        return (f"<div class=bar title='cached ahead of playback'>"
+                f"<i style='width:{pct:.0f}%'></i></div>")
+
+    streams = "".join(
+        f"<div class='card {s['level']}'><div class=row><b>{e(s['title'])}</b>"
+        f"{badge(s['level'])}</div><div class=muted>{e(s['file'])} · "
+        f"{e(s['state'] or 'unknown')}"
+        f"{' · ' + _mbps(s['bitrate']) + ' video' if s['bitrate'] else ''}</div>"
+        f"{bar(s['ahead_s'])}<p>{e(s['detail'])}</p></div>"
+        for s in d["streams"]) or "<p class=muted>Nothing playing in Plex.</p>"
+    checks = "".join(
+        f"<tr><td class=k>{e(x['title'])}</td><td>{badge(x['level'])}</td><td>{e(x['detail'])}</td></tr>"
+        for x in d["checks"])
     rows = "".join(
         f"<tr><td>{e(os.path.basename(j['path']))}</td><td>{e(j['kind'])}</td>"
         f"<td>{e(j['state'])}</td><td><progress max=100 value={j['percent']}></progress> "
-        f"{j['percent']}%</td><td>{'' if j['mb_s'] is None else j['mb_s']}</td></tr>"
-        for j in d["jobs"]) or "<tr><td colspan=5>Nothing being cached right now</td></tr>"
+        f"{j['percent']}%</td><td>{_mbps(j['rate']) if j['rate'] else ''}</td></tr>"
+        for j in d["jobs"]) or "<tr><td colspan=5 class=muted>Nothing being cached right now</td></tr>"
     recent = "".join(
         f"<tr><td>{e(os.path.basename(r['path']))}</td><td>{r['mb']} MB</td>"
-        f"<td>{r['secs']}s</td><td>{time.strftime('%H:%M', time.localtime(r['at']))}</td></tr>"
-        for r in d["recent"]) or "<tr><td colspan=4>None yet</td></tr>"
-    sessions = "".join(
-        f"<li>{e(s['title'] or '?')} ({e(s['state'] or 'unknown')})</li>"
-        for s in d["sessions"]) or "<li>Nothing playing</li>"
-    poll = ("never" if not d["last_poll"] else
-            time.strftime("%H:%M:%S", time.localtime(d["last_poll"])))
-    err = f"<p class=err>Last Plex poll failed: {e(d['poll_error'])}</p>" if d["poll_error"] else ""
+        f"<td>{_mbps(r['mb'] * MB / r['secs']) if r['secs'] else ''}</td>"
+        f"<td>{time.strftime('%H:%M', time.localtime(r['at']))}</td></tr>"
+        for r in d["recent"]) or "<tr><td colspan=4 class=muted>None yet</td></tr>"
     disk = c["disk"] or {}
     limits = " · ".join(f"{k.replace('_', ' ').lower()}: {e(v)}" for k, v in m.items() if v)
+    overall = d["overall"]
+    verdict = VERDICT[overall]
+    if not d["streams"] and overall in (GOOD, INFO):
+        verdict = "Nothing playing right now, and everything looks healthy."
     return f"""<!doctype html><html><head><meta charset=utf-8>
-<meta name=viewport content="width=device-width,initial-scale=1">
-<meta http-equiv=refresh content=10><title>Plex-Cache</title><style>
-:root{{color-scheme:light dark;--bg:#fff;--fg:#1c1c1c;--muted:#666;--line:#ddd}}
-@media (prefers-color-scheme:dark){{:root{{--bg:#16181d;--fg:#e6e6e6;--muted:#9a9a9a;--line:#333}}}}
+<meta name=viewport content="width=device-width,initial-scale=1"><title>Plex-Cache</title><style>
+:root{{color-scheme:light dark;--bg:#fff;--fg:#1c1c1c;--muted:#666;--line:#ddd;--card:#f6f6f7;
+--good:#1f8a4c;--warn:#b7791f;--bad:#c53030;--info:#4a6fa5}}
+@media (prefers-color-scheme:dark){{:root{{--bg:#16181d;--fg:#e6e6e6;--muted:#9a9a9a;
+--line:#333;--card:#1f2228;--good:#3fb871;--warn:#e0a43a;--bad:#ef5b5b;--info:#7aa2e3}}}}
 body{{background:var(--bg);color:var(--fg);font:15px system-ui,sans-serif;margin:0 auto;
-max-width:900px;padding:16px}}h1{{font-size:22px}}h2{{font-size:16px;margin-top:28px}}
+max-width:900px;padding:16px}}h1{{font-size:22px;margin:0}}h2{{font-size:16px;margin-top:28px}}
 table{{width:100%;border-collapse:collapse}}td,th{{text-align:left;padding:6px 8px;
-border-bottom:1px solid var(--line);overflow-wrap:anywhere}}.muted{{color:var(--muted)}}
-.err{{color:#d33}}.stats{{display:flex;gap:24px;flex-wrap:wrap}}.stats b{{display:block;
-font-size:20px}}</style></head><body>
-<h1>Plex-Cache</h1>{err}
+border-bottom:1px solid var(--line);overflow-wrap:anywhere;vertical-align:top}}
+.muted{{color:var(--muted);font-size:13px}}.row{{display:flex;justify-content:space-between;
+gap:8px;align-items:center}}.stats{{display:flex;gap:24px;flex-wrap:wrap;margin-top:12px}}
+.stats b{{display:block;font-size:20px}}.badge{{font-size:12px;font-weight:600;padding:2px 8px;
+border-radius:10px;color:#fff;white-space:nowrap}}.badge.good{{background:var(--good)}}
+.badge.warn{{background:var(--warn)}}.badge.bad{{background:var(--bad)}}
+.badge.info{{background:var(--info)}}.card{{background:var(--card);border-left:4px solid
+var(--info);border-radius:6px;padding:10px 12px;margin:8px 0}}.card p{{margin:6px 0 0}}
+.card.good{{border-color:var(--good)}}.card.warn{{border-color:var(--warn)}}
+.card.bad{{border-color:var(--bad)}}.verdict{{font-size:17px;font-weight:600;margin-top:12px}}
+.verdict.good{{color:var(--good)}}.verdict.warn{{color:var(--warn)}}
+.verdict.bad{{color:var(--bad)}}.verdict.info{{color:var(--info)}}
+.bar{{height:6px;background:var(--line);border-radius:3px;margin-top:8px;overflow:hidden}}
+.bar i{{display:block;height:100%;background:var(--good)}}.card.warn .bar i{{background:var(--warn)}}
+.card.bad .bar i{{background:var(--bad)}}button{{font:inherit;font-size:13px;padding:3px 10px}}
+details{{margin-top:24px}}.scroll{{overflow-x:auto}}td.k{{white-space:nowrap}}
+td.k+td{{width:1%}}progress{{width:90px}}html,body{{overflow-x:hidden}}</style></head><body>
+<div class=row><h1>Plex-Cache</h1><span class=muted><span id=updated></span>
+<button id=toggle type=button>Pause</button></span></div>
+<div id=main>
+<div class='verdict {overall}'>{e(verdict)}</div>
 <div class=stats><div><b>{_gb(c['used'])}</b><span class=muted>cached
 {('of ' + e(m['CACHE_MAX_SIZE'])) if m.get('CACHE_MAX_SIZE') else ''}</span></div>
 <div><b>{_gb(disk.get('free'))}</b><span class=muted>free on cache disk</span></div>
+<div><b>{_gb(d.get('mem_available'))}</b><span class=muted>RAM available</span></div>
 <div><b>{len(d['sessions'])}</b><span class=muted>playing in Plex</span></div></div>
-<p class=muted>{limits or 'Mount settings not readable'} · last checked Plex {poll}</p>
-<h2>Playing</h2><ul>{sessions}</ul>
-<h2>Caching now</h2><table><tr><th>File</th><th>Why</th><th>State</th><th>Progress</th>
-<th>MB/s</th></tr>{rows}</table>
-<h2>Recently cached</h2><table><tr><th>File</th><th>Read</th><th>Took</th><th>At</th></tr>
-{recent}</table></body></html>"""
+<h2>Streams</h2>{streams}
+<h2>Health</h2><div class=scroll><table>{checks}</table></div>
+<h2>Caching now</h2><div class=scroll><table><tr><th>File</th><th>Why</th><th>State</th><th>Progress</th>
+<th>Speed</th></tr>{rows}</table></div>
+<h2>Recently cached</h2><div class=scroll><table><tr><th>File</th><th>Read</th><th>Speed</th>
+<th>At</th></tr>{recent}</table></div>
+<p class=muted>{limits or 'Mount settings not readable'}</p>
+</div>
+<details><summary>What's normal?</summary>
+<p><b>Good</b>: the cache is at least {AHEAD_GOOD_S // 60} minutes ahead of playback and
+the link downloads at least {SPEED_GOOD_RATIO}x faster than the video plays, or the file is
+fully cached. A new stream starts amber for a minute while it builds a head start.</p>
+<p><b>Borderline</b>: under {AHEAD_WARN_S}s cached ahead, a link only just faster than the
+video, the cache full and evicting, or disk or RAM getting low. Playback usually holds, but
+there's little slack.</p>
+<p><b>Struggling</b>: Plex says it's buffering, playback has overtaken the cache, the link is
+slower than the video's bitrate, or the disk is below its free-space floor. Fixes: pre-warm
+with --warm before watching, lower the quality in Plex, or give the cache more disk.</p>
+</details>
+<script>
+(function () {{
+  var paused = false, last = Date.now(), failed = false;
+  try {{ paused = localStorage.getItem("plexcache-paused") === "1"; }} catch (e) {{}}
+  var btn = document.getElementById("toggle"), upd = document.getElementById("updated");
+  function label() {{
+    btn.textContent = paused ? "Resume" : "Pause";
+    var s = Math.round((Date.now() - last) / 1000);
+    upd.textContent = (failed ? "Can't reach the server · " : "") +
+      (paused ? "Live updates paused · " : "") + "updated " + (s < 2 ? "just now" : s + "s ago");
+  }}
+  btn.onclick = function () {{
+    paused = !paused;
+    try {{ localStorage.setItem("plexcache-paused", paused ? "1" : "0"); }} catch (e) {{}}
+    label(); if (!paused) refresh();
+  }};
+  function refresh() {{
+    if (paused) return;
+    fetch(location.href, {{cache: "no-store"}}).then(function (r) {{
+      if (!r.ok) throw new Error(r.status); return r.text();
+    }}).then(function (t) {{
+      var doc = new DOMParser().parseFromString(t, "text/html");
+      var next = doc.getElementById("main");
+      if (next) document.getElementById("main").innerHTML = next.innerHTML;
+      last = Date.now(); failed = false; label();
+    }}).catch(function () {{ failed = true; label(); }});
+  }}
+  setInterval(refresh, 5000); setInterval(label, 1000); label();
+}})();
+</script></body></html>"""
 
 
 def start_status_server(cfg: Config, pf: Prefetcher) -> None:
