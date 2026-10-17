@@ -3,6 +3,11 @@
 The version is shown on the status page (`/plexcache/`) and by
 `python3 /opt/plex-precache/plex_precache.py --version`.
 
+## 1.4.0 (17 Oct 2026)
+
+- Restarts and updates no longer forget what has been cached, the recent downloads list or the graphs. They're saved in /var/lib/plex-precache/state.json.
+- New "Last 24 hours" graphs on the status page: cache size, pre-cache download speed, and streams playing, marked in red wherever one was buffering.
+
 ## 1.3.1 (10 Oct 2026)
 
 - Fixed: an episode whose start had already been pre-cached as "next episode" wasn't downloaded in full when you played it.

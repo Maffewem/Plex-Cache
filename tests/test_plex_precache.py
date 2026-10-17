@@ -649,6 +649,43 @@ class RcloneSettingsTests(unittest.TestCase):
         self.assertIn("--nonsense", open(self.env).read())
 
 
+class StateTests(unittest.TestCase):
+    def test_state_survives_restart(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = pp.Config(None)
+            cfg.state_file = os.path.join(d, "sub", "state.json")
+            pf = pp.Prefetcher(cfg)
+            now = pp.time.time()
+            pf.done["/m/a.mkv"] = now
+            pf.done["/m/old.mkv"] = now - cfg.remember - 10
+            pf.heads["/m/b.mkv"] = now
+            pf.recent.append({"path": "/m/a.mkv", "mb": 5, "secs": 1, "at": now})
+            pf.history.append({"t": now - 90000, "cache": 1})  # older than a day
+            pf.record_history({"cache": {"used": 2 * pp.MB}, "streams": [{"level": pp.BAD}],
+                               "jobs": [{"rate": pp.MB, "state": "reading"}]})
+            pf.save_state()
+            pf2 = pp.Prefetcher(cfg)
+            pf2.load_state()
+            self.assertEqual(set(pf2.done), {"/m/a.mkv"})
+            self.assertIn("/m/b.mkv", pf2.heads)
+            self.assertEqual(len(pf2.recent), 1)
+            self.assertEqual([(p["playing"], p["waiting"]) for p in pf2.history], [(1, 1)])
+            # A broken file is ignored rather than stopping the service.
+            with open(cfg.state_file, "w") as f:
+                f.write("{not json")
+            pp.Prefetcher(cfg).load_state()
+
+    def test_history_graphs(self):
+        now = 1_000_000.0
+        self.assertIn("once Plex-Cache has been running", pp.render_history([], now))
+        pts = [{"t": now - 600 + i * 60, "cache": i * pp.MB, "mbps": i, "playing": 1,
+                "waiting": 1 if i == 3 else 0} for i in range(10)]
+        html_ = pp.render_history(pts, now)
+        self.assertEqual(html_.count("<svg"), 3)
+        self.assertIn("class='g-wait'", html_)
+        self.assertIn("buffering about 1 min", html_)
+
+
 class VersionTests(unittest.TestCase):
     def test_changelog_matches_version(self):
         path = os.path.join(os.path.dirname(__file__), "..", "CHANGELOG.md")

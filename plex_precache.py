@@ -36,8 +36,8 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 
-__version__ = "1.3.1"
-__released__ = "2026-10-10"
+__version__ = "1.4.0"
+__released__ = "2026-10-17"
 
 log = logging.getLogger("plex-precache")
 
@@ -63,6 +63,7 @@ DEFAULTS = {
     "auto_update": "false",
     "stop_after_minutes": "10",
     "taper_mb_s": "5",
+    "state_file": "/var/lib/plex-precache/state.json",
 }
 
 # Lower number runs first.
@@ -72,6 +73,10 @@ PRIO_ON_DECK = 2
 PRIO_MANUAL = 3
 
 MB = 1024 * 1024
+
+# Graph on the status page: a point a minute for 24 hours.
+HISTORY_STEP = 60
+HISTORY_POINTS = 24 * 60
 
 
 class Config:
@@ -105,6 +110,7 @@ class Config:
         self.auto_update = s.getboolean("auto_update")
         self.stop_after = s.getfloat("stop_after_minutes") * 60
         self.taper = s.getfloat("taper_mb_s") * MB
+        self.state_file = s.get("state_file")
         # Longest prefix first so nested mappings win.
         self.path_map = sorted(cp["path_map"].items(), key=lambda kv: -len(kv[0]))
 
@@ -317,6 +323,8 @@ class Prefetcher:
         self.heads: dict[str, float] = {}  # path -> time just its start finished
         # For the status page.
         self.recent: collections.deque = collections.deque(maxlen=25)
+        # One sample a minute for the last day, for the graphs.
+        self.history: collections.deque = collections.deque(maxlen=HISTORY_POINTS)
         self.sessions: list[dict] = []
         self.last_poll: tuple[float, str | None] = (0.0, None)
         self.warned: set[str] = set()
@@ -536,12 +544,77 @@ class Prefetcher:
             done = dict(self.done)
         return {"jobs": rows, "done": done, "poll_secs": self.last_poll_secs, "warned": sorted(self.warned),
                 "blocked": dict(self.blocked), "recent": list(self.recent), "sessions": self.sessions,
-                "last_poll": polled, "poll_error": err}
+                "last_poll": polled, "poll_error": err, "history": list(self.history)}
 
     def shutdown(self, *_args) -> None:
         self.stop.set()
         with self.cv:
             self.cv.notify_all()
+
+    # What was cached, recent downloads and the graphs survive restarts and updates.
+
+    def save_state(self) -> None:
+        path = self.cfg.state_file
+        if not path:
+            return
+        with self.cv:
+            state = {"version": 1, "done": dict(self.done), "heads": dict(self.heads),
+                     "recent": list(self.recent), "history": list(self.history)}
+        tmp = path + ".tmp"
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(tmp, "w") as f:
+                json.dump(state, f)
+            os.replace(tmp, path)
+        except OSError as e:
+            log.warning("could not save state to %s: %s", path, e)
+
+    def load_state(self) -> None:
+        path = self.cfg.state_file
+        if not path:
+            return
+        try:
+            with open(path) as f:
+                state = json.load(f)
+        except FileNotFoundError:
+            return
+        except (OSError, ValueError) as e:
+            log.warning("ignoring unreadable state file %s: %s", path, e)
+            return
+        if not isinstance(state, dict):
+            return
+        with self.cv:
+            for name in ("done", "heads"):
+                saved = state.get(name)
+                if isinstance(saved, dict):
+                    getattr(self, name).update(
+                        {str(k): float(v) for k, v in saved.items()
+                         if isinstance(v, (int, float))})
+            for name in ("recent", "history"):
+                saved = state.get(name)
+                if isinstance(saved, list):
+                    getattr(self, name).extend(x for x in saved if isinstance(x, dict))
+        self.forget_expired()
+        cutoff = time.time() - HISTORY_POINTS * HISTORY_STEP
+        with self.cv:
+            while self.history and self.history[0].get("t", 0) < cutoff:
+                self.history.popleft()
+        log.info("restored state: %d cached files, %d graph points",
+                 len(self.done), len(self.history))
+
+    def record_history(self, data: dict) -> None:
+        """Add one graph point from a status_data() snapshot."""
+        streams = data.get("streams") or []
+        point = {
+            "t": round(time.time()),
+            "cache": data["cache"].get("used") if data.get("cache") else None,
+            "mbps": round(sum(j.get("rate") or 0 for j in data.get("jobs", [])
+                              if j.get("state") != "queued") * 8 / 1e6, 1),
+            "playing": len(streams),
+            "waiting": sum(1 for x in streams if x.get("level") == BAD),
+        }
+        with self.cv:
+            self.history.append(point)
 
 
 def poll_once(plex: Plex, cfg: Config, pf: Prefetcher) -> None:
@@ -626,11 +699,13 @@ def run_daemon(cfg: Config) -> None:
     pf = Prefetcher(cfg)
     signal.signal(signal.SIGTERM, pf.shutdown)
     signal.signal(signal.SIGINT, pf.shutdown)
+    pf.load_state()
     pf.ensure_workers()
     if cfg.status_port:
         start_status_server(cfg, pf)
     log.info("watching %s every %.0fs with %d workers",
              cfg.plex_url, cfg.poll_interval, cfg.workers)
+    last_sample = 0.0
     while not pf.stop.is_set():
         t0 = time.time()
         try:
@@ -645,7 +720,15 @@ def run_daemon(cfg: Config) -> None:
             log.warning("poll failed: %s", e)
             pf.last_poll = (time.time(), str(e))
         pf.forget_expired()
+        if time.time() - last_sample >= HISTORY_STEP:
+            last_sample = time.time()
+            try:
+                pf.record_history(status_data(cfg, pf))
+            except Exception as e:  # a graph point is never worth stopping for
+                log.warning("could not record history: %s", e)
+            pf.save_state()
         pf.stop.wait(cfg.poll_interval)
+    pf.save_state()
 
 
 # --------------------------------------------------------------------------
@@ -922,6 +1005,61 @@ VERDICT = {
 }
 
 
+def _spark(points: list[dict], key: str, t0: float, span: float, cls: str,
+           area: bool = False) -> tuple[str, float]:
+    """An SVG path for one series, drawn 600 wide by 60 high; returns (svg, max)."""
+    vals = [(p["t"], p.get(key)) for p in points if isinstance(p.get(key), (int, float))]
+    top = max([v for _, v in vals] + [0])
+    if not vals or top <= 0:
+        return "", top
+    def xy(t, v):
+        return f"{(t - t0) / span * 600:.1f},{58 - v / top * 54:.1f}"
+    # Break the line where the service wasn't running.
+    segs, cur, prev = [], [], None
+    for t, v in vals:
+        if prev is not None and t - prev > HISTORY_STEP * 5:
+            segs.append(cur); cur = []
+        cur.append((t, v)); prev = t
+    segs.append(cur)
+    out = []
+    for seg in segs:
+        d = "M" + " L".join(xy(t, v) for t, v in seg)
+        if area:
+            out.append(f"<path class='{cls} fill' d='{d} L{xy(seg[-1][0], 0)} L{xy(seg[0][0], 0)} Z'/>")
+        out.append(f"<path class='{cls}' d='{d}'/>")
+    return "".join(out), top
+
+
+def render_history(points: list[dict], now: float | None = None) -> str:
+    """Three small graphs over the last 24 hours."""
+    e = html.escape
+    now = now or time.time()
+    span = HISTORY_POINTS * HISTORY_STEP
+    t0 = now - span
+    points = [p for p in points if isinstance(p, dict) and p.get("t", 0) >= t0]
+    if len(points) < 2:
+        return ("<p class=muted>Graphs appear here once Plex-Cache has been running for a "
+                "few minutes.</p>")
+    rows = []
+    cache, top = _spark(points, "cache", t0, span, "g-cache")
+    rows.append(("Cache size", cache, _gb(top) + " max"))
+    dl, top = _spark(points, "mbps", t0, span, "g-dl", area=True)
+    rows.append(("Pre-cache download speed", dl, f"{top:.0f} Mbps max"))
+    playing, top = _spark(points, "playing", t0, span, "g-play", area=True)
+    waits = [p for p in points if p.get("waiting")]
+    marks = "".join(
+        f"<rect class='g-wait' x='{(p['t'] - t0) / span * 600 - 1:.1f}' y='0' width='2' height='60'/>"
+        for p in waits)
+    mins = len(waits) * HISTORY_STEP // 60
+    rows.append(("Streams playing, red where one was buffering", marks + playing,
+                 f"buffering about {mins} min" if mins else "no buffering"))
+    body = "".join(
+        f"<div class=graph><div class=row><span>{e(label)}</span><span class=muted>{e(note)}</span></div>"
+        f"<svg viewBox='0 0 600 60' preserveAspectRatio=none role=img aria-label='{e(label)}'>{svg}</svg></div>"
+        for label, svg, note in rows)
+    return body + "<div class='row muted'><span>24 hours ago</span><span>now</span></div>"
+
+
 def render_status(d: dict, settings: str = "") -> str:
     e = html.escape
     c = d["cache"]
@@ -991,6 +1129,11 @@ var(--info);border-radius:6px;padding:10px 12px;margin:8px 0}}.card p{{margin:6p
 .bar i{{display:block;height:100%;background:var(--good)}}.card.warn .bar i{{background:var(--warn)}}
 .card.bad .bar i{{background:var(--bad)}}button{{font:inherit;font-size:13px;font-weight:600;padding:7px 14px;border-radius:8px;border:1px solid var(--line);background:var(--btn);color:var(--fg);cursor:pointer;transition:filter .15s,border-color .15s}}button:hover{{filter:brightness(1.08);border-color:var(--muted)}}button:active{{transform:translateY(1px)}}button:disabled{{opacity:.55;cursor:default}}button:focus-visible{{outline:2px solid var(--accent);outline-offset:2px}}button.pri{{background:var(--accent);color:var(--accent-fg);border-color:var(--accent)}}#theme{{margin-left:auto;margin-right:8px;border-radius:999px;padding:5px 12px}}
 details{{margin-top:24px}}
+.graph{{margin:10px 0}}.graph svg{{display:block;width:100%;height:60px;background:var(--card);
+border-radius:6px;margin-top:4px}}.graph path{{fill:none;stroke-width:1.5;vector-effect:non-scaling-stroke}}
+.graph path.fill{{stroke:none;opacity:.18}}.g-cache{{stroke:var(--info)}}.g-dl{{stroke:var(--good)}}
+.g-dl.fill{{fill:var(--good)}}.g-play{{stroke:var(--accent)}}.g-play.fill{{fill:var(--accent)}}
+.g-wait{{fill:var(--bad);opacity:.5}}
 .live{{display:inline-flex;align-items:center;gap:8px;border:1px solid var(--line);
 background:var(--card);color:var(--fg);border-radius:999px;padding:5px 12px 5px 10px;
 cursor:pointer;font-size:13px;line-height:1.2}}.live:hover{{border-color:var(--muted)}}
@@ -1019,6 +1162,7 @@ title="Pause or resume live updates"><span class=dot></span><b id=livetext>Live<
 <div><b>{_gb(d.get('mem_available'))}</b><span class=muted>RAM available</span></div>
 <div><b>{len(d['sessions'])}</b><span class=muted>playing in Plex</span></div></div>
 <h2>Streams</h2>{streams}
+<h2>Last 24 hours</h2>{render_history(d.get("history") or [])}
 <h2>Health</h2><div class=scroll><table>{checks}</table></div>
 <h2>Caching now</h2><div class=scroll><table><tr><th>File</th><th>Why</th><th>State</th><th>Progress</th>
 <th>Speed</th></tr>{rows}</table></div>
