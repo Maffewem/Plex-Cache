@@ -278,6 +278,7 @@ FS-Cache has no read-ahead or size controls, so rclone is the better choice.
 | `taper_mb_s` | 5 | Until then, cap those downloads at this many MB/s, easing off to nothing by the stop, so the link is free for whatever is watched next; 0 = full speed |
 | `state_file` | /var/lib/plex-precache/state.json | Where what has been cached, recent downloads and the 24-hour graphs are kept, so restarts and updates don't forget them; empty = don't keep |
 | `status_port` | 8789 | Status page port on 127.0.0.1 (0 disables) |
+| `status_key_file` | /etc/plex-precache/status.key | Secret nginx sends with each request; the page refuses requests without it. Created by the installer; if the file doesn't exist the page needs no key |
 | `[path_map]` | | Translate Plex's paths if Plex sees a different path (Docker) |
 
 To warm something by hand, e.g. a show you're about to binge:

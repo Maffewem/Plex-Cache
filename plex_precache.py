@@ -16,6 +16,7 @@ import collections
 import configparser
 import heapq
 import html
+import http.client
 import http.server
 import io
 import itertools
@@ -36,8 +37,8 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 
-__version__ = "1.4.0"
-__released__ = "2026-10-17"
+__version__ = "1.4.1"
+__released__ = "2026-10-23"
 
 log = logging.getLogger("plex-precache")
 
@@ -58,6 +59,7 @@ DEFAULTS = {
     "min_free_gb": "10",
     "status_bind": "127.0.0.1",
     "status_port": "8789",
+    "status_key_file": "/etc/plex-precache/status.key",
     "mount_env": "/etc/plex-precache/rclone-mount.env",
     "require_cache_mount": "true",
     "auto_update": "false",
@@ -77,6 +79,23 @@ MB = 1024 * 1024
 # Graph on the status page: a point a minute for 24 hours.
 HISTORY_STEP = 60
 HISTORY_POINTS = 24 * 60
+
+
+def read_status_key(path: str) -> str:
+    """The secret nginx sends with every request; empty when the file isn't there.
+
+    A key file that exists but can't be read stops the service rather than
+    leaving the status page open to every local user.
+    """
+    if not path:
+        return ""
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except FileNotFoundError:
+        return ""
+    except OSError as e:
+        raise SystemExit(f"status key file not readable: {path}: {e}")
 
 
 class Config:
@@ -105,6 +124,7 @@ class Config:
         self.min_free = int(s.getfloat("min_free_gb") * 1024 * MB)
         self.status_bind = s.get("status_bind")
         self.status_port = s.getint("status_port")
+        self.status_key = read_status_key(s.get("status_key_file"))
         self.mount_env = s.get("mount_env")
         self.require_cache_mount = s.getboolean("require_cache_mount")
         self.auto_update = s.getboolean("auto_update")
@@ -321,6 +341,9 @@ class Prefetcher:
         self.active: dict[str, Job] = {}  # queued or running, by local path
         self.done: dict[str, float] = {}  # path -> time the whole file finished
         self.heads: dict[str, float] = {}  # path -> time just its start finished
+        # path -> (offset, time) for files read from the middle to the end: only
+        # the part from that offset on is cached.
+        self.tails: dict[str, tuple[int, float]] = {}
         # For the status page.
         self.recent: collections.deque = collections.deque(maxlen=25)
         # One sample a minute for the last day, for the graphs.
@@ -344,6 +367,10 @@ class Prefetcher:
             # as done once the file is actually played.
             finished = self.done.get(path) or (self.heads.get(path) if end else None)
             if finished and time.time() - finished < self.cfg.remember:
+                return
+            tail = self.tails.get(path)
+            if (tail and end is None and start >= tail[0]
+                    and time.time() - tail[1] < self.cfg.remember):
                 return
         if self.cfg.require_cache_mount and self.uncached_mount(path):
             return
@@ -386,6 +413,15 @@ class Prefetcher:
                 heapq.heappush(self.queue, (prio, next(self.counter), job))
                 self.cv.notify()
 
+    def refresh_blocked(self) -> None:
+        """Forget mounts that now cache (e.g. after the SSHFS switch) or changed type."""
+        for mnt, old in list(self.blocked.items()):
+            _m, fstype, opts = mount_info(mnt)
+            if caches_to_disk(fstype, opts):
+                del self.blocked[mnt]
+            elif fstype != old:
+                self.blocked[mnt] = fstype
+
     def uncached_mount(self, path: str) -> str | None:
         """The mountpoint if `path` is on a filesystem that can't cache to disk.
 
@@ -394,6 +430,7 @@ class Prefetcher:
         """
         mnt, fstype, opts = mount_info(path)
         if caches_to_disk(fstype, opts):
+            self.blocked.pop(mnt, None)
             return None
         if mnt not in self.blocked:
             self.blocked[mnt] = fstype
@@ -465,7 +502,16 @@ class Prefetcher:
                         del self.active[job.path]
                     # Failed reads are retried on the next poll.
                     if ok and not self.stop.is_set():
-                        (self.heads if job.end else self.done)[job.path] = time.time()
+                        now = time.time()
+                        if job.end:
+                            self.heads[job.path] = now
+                        elif job.start > 0:
+                            # Started mid-file (the playhead): not the whole file.
+                            old = self.tails.get(job.path)
+                            self.tails[job.path] = (min(job.start, old[0]) if old else job.start,
+                                                    now)
+                        else:
+                            self.done[job.path] = now
 
     def saw_playing(self, paths: list[str]) -> None:
         now = time.time()
@@ -515,6 +561,8 @@ class Prefetcher:
             for seen in (self.done, self.heads):
                 for path in [p for p, t in seen.items() if t < cutoff]:
                     del seen[path]
+            for path in [p for p, (_o, t) in self.tails.items() if t < cutoff]:
+                del self.tails[path]
 
     def snapshot(self) -> dict:
         """State for the status page."""
@@ -542,7 +590,8 @@ class Prefetcher:
         polled, err = self.last_poll
         with self.cv:
             done = dict(self.done)
-        return {"jobs": rows, "done": done, "poll_secs": self.last_poll_secs, "warned": sorted(self.warned),
+            tails = {p: o for p, (o, _t) in self.tails.items()}
+        return {"jobs": rows, "done": done, "tails": tails, "poll_secs": self.last_poll_secs, "warned": sorted(self.warned),
                 "blocked": dict(self.blocked), "recent": list(self.recent), "sessions": self.sessions,
                 "last_poll": polled, "poll_error": err, "history": list(self.history)}
 
@@ -559,6 +608,7 @@ class Prefetcher:
             return
         with self.cv:
             state = {"version": 1, "done": dict(self.done), "heads": dict(self.heads),
+                     "tails": {p: [o, t] for p, (o, t) in self.tails.items()},
                      "recent": list(self.recent), "history": list(self.history)}
         tmp = path + ".tmp"
         try:
@@ -584,6 +634,12 @@ class Prefetcher:
         if not isinstance(state, dict):
             return
         with self.cv:
+            saved = state.get("tails")
+            if isinstance(saved, dict):
+                for k, v in saved.items():
+                    if (isinstance(v, list) and len(v) == 2
+                            and all(isinstance(x, (int, float)) for x in v)):
+                        self.tails[str(k)] = (int(v[0]), float(v[1]))
             for name in ("done", "heads"):
                 saved = state.get(name)
                 if isinstance(saved, dict):
@@ -618,6 +674,7 @@ class Prefetcher:
 
 
 def poll_once(plex: Plex, cfg: Config, pf: Prefetcher) -> None:
+    pf.refresh_blocked()
     sessions = parse_sessions(plex.get("/status/sessions"))
     for s in sessions:
         s["path"] = cfg.local_path(s["file"])
@@ -716,7 +773,7 @@ def run_daemon(cfg: Config) -> None:
             if pf.last_poll_secs > 10:
                 log.warning("checking Plex took %.0fs; the media mount is slow to respond",
                             pf.last_poll_secs)
-        except (OSError, ET.ParseError) as e:
+        except (OSError, ET.ParseError, http.client.HTTPException) as e:
             log.warning("poll failed: %s", e)
             pf.last_poll = (time.time(), str(e))
         pf.forget_expired()
@@ -857,6 +914,9 @@ def stream_health(s: dict, d: dict, now: float | None = None) -> dict:
 
     if job is None and path in d.get("done", {}):
         level, msg = GOOD, "Fully cached: playing from local disk."
+        out["ahead_s"] = (size - playhead) / bitrate if bitrate else None
+    elif job is None and playhead >= d.get("tails", {}).get(path, size + 1):
+        level, msg = GOOD, "Cached from here to the end: playing from local disk."
         out["ahead_s"] = (size - playhead) / bitrate if bitrate else None
     elif job is not None and job["state"] == "queued":
         level, msg = WARN, ("Waiting for a free worker; other downloads are using them. "
@@ -1299,7 +1359,7 @@ with --warm before watching, lower the quality in Plex, or give the cache more d
       try {{ sessionStorage.setItem("plexcache-scroll", String(window.scrollY)); }} catch (e) {{}}
     }});
   }});
-  if (/[?&]saved=1/.test(location.search)) {{
+  if (/[?&]saved=/.test(location.search)) {{
     var y = null;
     try {{ y = sessionStorage.getItem("plexcache-scroll");
            sessionStorage.removeItem("plexcache-scroll"); }} catch (e) {{}}
@@ -1373,6 +1433,17 @@ RCLONE_DEFAULTS = {"VFS_CHUNK_SIZE": "64M", "DIR_CACHE_TIME": "1h"}
 # Flags that would point rclone somewhere else or expose it; set elsewhere or not at all.
 BLOCKED_FLAGS = ("--config", "--cache-dir", "--rc", "--daemon", "--allow-root",
                  "--log-file", "--password-command", "--user-agent", "--ask-password")
+# Only mount-tuning flags are accepted. rclone has flags that run programs
+# (--sftp-ssh), open listeners (--metrics-addr) or redirect the remote
+# (--sftp-host), and the service user can write this setting.
+ALLOWED_FLAGS = ("--bwlimit", "--bwlimit-file", "--transfers", "--checkers", "--tpslimit",
+                 "--tpslimit-burst", "--timeout", "--contimeout", "--retries",
+                 "--low-level-retries", "--attr-timeout", "--poll-interval", "--no-modtime",
+                 "--no-checksum", "--no-seek", "--read-only", "--async-read", "--use-mmap",
+                 "--max-read-ahead", "--multi-thread-streams", "--multi-thread-cutoff",
+                 "--sftp-concurrency", "--sftp-chunk-size", "--sftp-idle-timeout",
+                 "--sftp-set-modtime", "--sftp-disable-concurrent-reads",
+                 "--sftp-disable-concurrent-writes", "--sftp-use-fstat")
 FLAG_TOKEN_RE = re.compile(r"^(--?[A-Za-z0-9][A-Za-z0-9-]*(=[A-Za-z0-9._:/,+@%-]*)?"
                            r"|[A-Za-z0-9._:/,+@%-]+)$")
 SIZE_RE = re.compile(r"^\d+(\.\d+)?[KMGT]$")
@@ -1471,8 +1542,10 @@ def validate_flags(raw: str) -> str:
         if not FLAG_TOKEN_RE.match(t):
             raise SettingsError(f"Extra rclone flags: can't use {t!r}. Use plain flags "
                                 "like --bwlimit 80M.")
-        if t.startswith("-") and t.split("=", 1)[0].startswith(BLOCKED_FLAGS):
-            raise SettingsError(f"Extra rclone flags: {t.split('=', 1)[0]} can't be set here.")
+        name = t.split("=", 1)[0]
+        if t.startswith("-") and (name.startswith(BLOCKED_FLAGS)
+                                  or not (name.startswith("--vfs-") or name in ALLOWED_FLAGS)):
+            raise SettingsError(f"Extra rclone flags: {name} can't be set here.")
     if tokens and not tokens[0].startswith("-"):
         raise SettingsError("Extra rclone flags must start with a flag such as --bwlimit.")
     return " ".join(tokens)
@@ -2190,39 +2263,73 @@ PANEL_FOR_ACTION = {
 }
 
 
-def start_status_server(cfg: Config, pf: Prefetcher) -> None:
+def start_status_server(cfg: Config, pf: Prefetcher) -> http.server.ThreadingHTTPServer | None:
     token = secrets.token_urlsafe(24)  # CSRF token for the settings forms
-    last_msg: dict = {}
+    # What each save said, by id, so the page that asked gets its own answer.
+    messages: dict = {}
+    msg_lock = threading.Lock()
 
     class Handler(http.server.BaseHTTPRequestHandler):
+        timeout = 30  # a stalled client can't hold a thread forever
+
         def _send(self, body: bytes, ctype: str, status: int = 200) -> None:
             self.send_response(status)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
+            # Not to be framed by another site (clickjacking on the Update/Switch buttons).
+            self.send_header("X-Frame-Options", "DENY")
+            self.send_header("Content-Security-Policy", "frame-ancestors 'none'")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Referrer-Policy", "no-referrer")
             self.end_headers()
             self.wfile.write(body)
 
+        def _authorized(self) -> bool:
+            """nginx adds the key after its own login; other local users don't have it."""
+            key = cfg.status_key
+            if not key:
+                return True
+            got = self.headers.get("X-Plexcache-Key", "")
+            if secrets.compare_digest(got.encode(), key.encode()):
+                return True
+            self._send(b"Forbidden", "text/plain", 403)
+            return False
+
         def do_GET(self):
+            if not self._authorized():
+                return
             data = status_data(cfg, pf)
             if self.path.rstrip("/").endswith("/api/status"):
                 data = dict(data, build=installed_version())
                 self._send(json.dumps(data).encode(), "application/json")
                 return
-            msg = last_msg.pop("text", None) if "saved=1" in self.path else None
-            ok = last_msg.pop("ok", True)
-            prefill = last_msg.pop("conn", None) if msg else None
+            note = {}
+            m = re.search(r"[?&]saved=([A-Za-z0-9_-]+)", self.path)
+            if m:
+                with msg_lock:
+                    note = messages.pop(m.group(1), {})
+            msg, ok, prefill = note.get("text"), note.get("ok", True), note.get("conn")
             settings = render_settings(cfg, token, msg, ok, prefill) if cfg.path else ""
             self._send(render_status(data, settings).encode(), "text/html; charset=utf-8")
 
         def do_POST(self):
-            length = min(int(self.headers.get("Content-Length") or 0), 64 * 1024)
+            if not self._authorized():
+                return
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                length = -1
+            if length < 0 or length > 64 * 1024:
+                self._send(b"Bad request", "text/plain", 400 if length < 0 else 413)
+                return
             form = {k: v[-1] for k, v in urllib.parse.parse_qs(
                 self.rfile.read(length).decode("utf-8", "replace")).items()}
             if not secrets.compare_digest(form.get("token", ""), token):
                 self._send(b"Stale or missing form token; reload the page.", "text/plain", 403)
                 return
             action = self.path.split("?")[0].rstrip("/").rsplit("/", 2)[-2:]
+            note: dict = {}
             try:
                 if action == ["settings", "prefetch"]:
                     text = apply_prefetch_settings(cfg, pf, form)
@@ -2230,11 +2337,11 @@ def start_status_server(cfg: Config, pf: Prefetcher) -> None:
                     text = apply_mount_settings(cfg, form)
                 elif action == ["settings", "connection"]:
                     # Keep what was typed (not the key) so a test can be followed by a save.
-                    last_msg["conn"] = {k: form.get(k, "") for k in
-                                        ("host", "user", "port", "path", "mountpoint")}
+                    note["conn"] = {k: form.get(k, "") for k in
+                                    ("host", "user", "port", "path", "mountpoint")}
                     text = apply_connection(cfg, form)
                     if form.get("do") != "test":
-                        last_msg.pop("conn", None)
+                        note.pop("conn", None)
                 elif action == ["settings", "recommended"]:
                     text = apply_recommended(cfg, pf, form)
                 elif action == ["switch", "check"]:
@@ -2256,17 +2363,22 @@ def start_status_server(cfg: Config, pf: Prefetcher) -> None:
                 else:
                     self._send(b"Not found", "text/plain", 404)
                     return
-                last_msg.update(text=text, ok=not text.startswith("Couldn't")
-                                and "couldn't" not in text)
+                note.update(text=text, ok=not text.startswith("Couldn't")
+                            and "couldn't" not in text)
                 log.info("web: %s", text)
             except (SettingsError, OSError) as err:
-                last_msg.update(text=str(err), ok=False)
+                note.update(text=str(err), ok=False)
+            msg_id = secrets.token_urlsafe(8)
+            with msg_lock:
+                messages[msg_id] = note
+                while len(messages) > 20:
+                    del messages[next(iter(messages))]
             # Back to the page; relative so it works behind nginx's /plexcache/ prefix.
             depth = self.path.split("?")[0].strip("/").count("/")
             anchor = PANEL_FOR_ACTION.get("/".join(action), PANEL_FOR_ACTION.get(action[-1],
                                                                                   "settings"))
             self.send_response(303)
-            self.send_header("Location", "../" * depth + "./?saved=1#" + anchor)
+            self.send_header("Location", "../" * depth + "./?saved=" + msg_id + "#" + anchor)
             self.end_headers()
 
         def log_message(self, *_args):
@@ -2276,9 +2388,10 @@ def start_status_server(cfg: Config, pf: Prefetcher) -> None:
         srv = http.server.ThreadingHTTPServer((cfg.status_bind, cfg.status_port), Handler)
     except OSError as e:
         log.warning("status page disabled: %s", e)
-        return
+        return None
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     log.info("status page on http://%s:%d/", cfg.status_bind, cfg.status_port)
+    return srv
 
 
 def warm(cfg: Config, paths: list[str]) -> None:

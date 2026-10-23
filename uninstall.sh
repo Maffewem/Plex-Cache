@@ -9,7 +9,13 @@ PURGE=0
 
 CACHE_DIR=""
 if [ -f /etc/plex-precache/rclone-mount.env ]; then
-  CACHE_DIR="$(sed -n 's/^CACHE_DIR=//p' /etc/plex-precache/rclone-mount.env)"
+  CACHE_DIR="$(sed -n 's/^CACHE_DIR=//p' /etc/plex-precache/rclone-mount.env | tail -1)"
+  # That file is writable by the service user; never delete a system folder because of it.
+  case "${CACHE_DIR%/}" in
+    ""|/|/bin|/boot|/dev|/etc|/home|/lib|/lib64|/media|/mnt|/opt|/proc|/root|/run|/sbin|/srv|/sys|/tmp|/usr|/var|/var/lib|/var/cache|\
+    /bin/*|/boot/*|/dev/*|/etc/*|/lib/*|/lib64/*|/proc/*|/root/*|/run/*|/sbin/*|/sys/*|/usr/*|*..*|[!/]*)
+      CACHE_DIR="" ;;
+  esac
 fi
 
 # Put SSHFS back first if Plex-Cache replaced it, so Plex keeps its media.
