@@ -16,6 +16,7 @@ import collections
 import configparser
 import heapq
 import html
+import http.client
 import http.server
 import io
 import itertools
@@ -36,8 +37,8 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 
-__version__ = "1.3.1"
-__released__ = "2026-10-10"
+__version__ = "1.4.1"
+__released__ = "2026-10-23"
 
 log = logging.getLogger("plex-precache")
 
@@ -58,11 +59,13 @@ DEFAULTS = {
     "min_free_gb": "10",
     "status_bind": "127.0.0.1",
     "status_port": "8789",
+    "status_key_file": "/etc/plex-precache/status.key",
     "mount_env": "/etc/plex-precache/rclone-mount.env",
     "require_cache_mount": "true",
     "auto_update": "false",
     "stop_after_minutes": "10",
     "taper_mb_s": "5",
+    "state_file": "/var/lib/plex-precache/state.json",
 }
 
 # Lower number runs first.
@@ -72,6 +75,27 @@ PRIO_ON_DECK = 2
 PRIO_MANUAL = 3
 
 MB = 1024 * 1024
+
+# Graph on the status page: a point a minute for 24 hours.
+HISTORY_STEP = 60
+HISTORY_POINTS = 24 * 60
+
+
+def read_status_key(path: str) -> str:
+    """The secret nginx sends with every request; empty when the file isn't there.
+
+    A key file that exists but can't be read stops the service rather than
+    leaving the status page open to every local user.
+    """
+    if not path:
+        return ""
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except FileNotFoundError:
+        return ""
+    except OSError as e:
+        raise SystemExit(f"status key file not readable: {path}: {e}")
 
 
 class Config:
@@ -100,11 +124,13 @@ class Config:
         self.min_free = int(s.getfloat("min_free_gb") * 1024 * MB)
         self.status_bind = s.get("status_bind")
         self.status_port = s.getint("status_port")
+        self.status_key = read_status_key(s.get("status_key_file"))
         self.mount_env = s.get("mount_env")
         self.require_cache_mount = s.getboolean("require_cache_mount")
         self.auto_update = s.getboolean("auto_update")
         self.stop_after = s.getfloat("stop_after_minutes") * 60
         self.taper = s.getfloat("taper_mb_s") * MB
+        self.state_file = s.get("state_file")
         # Longest prefix first so nested mappings win.
         self.path_map = sorted(cp["path_map"].items(), key=lambda kv: -len(kv[0]))
 
@@ -315,8 +341,13 @@ class Prefetcher:
         self.active: dict[str, Job] = {}  # queued or running, by local path
         self.done: dict[str, float] = {}  # path -> time the whole file finished
         self.heads: dict[str, float] = {}  # path -> time just its start finished
+        # path -> (offset, time) for files read from the middle to the end: only
+        # the part from that offset on is cached.
+        self.tails: dict[str, tuple[int, float]] = {}
         # For the status page.
         self.recent: collections.deque = collections.deque(maxlen=25)
+        # One sample a minute for the last day, for the graphs.
+        self.history: collections.deque = collections.deque(maxlen=HISTORY_POINTS)
         self.sessions: list[dict] = []
         self.last_poll: tuple[float, str | None] = (0.0, None)
         self.warned: set[str] = set()
@@ -336,6 +367,10 @@ class Prefetcher:
             # as done once the file is actually played.
             finished = self.done.get(path) or (self.heads.get(path) if end else None)
             if finished and time.time() - finished < self.cfg.remember:
+                return
+            tail = self.tails.get(path)
+            if (tail and end is None and start >= tail[0]
+                    and time.time() - tail[1] < self.cfg.remember):
                 return
         if self.cfg.require_cache_mount and self.uncached_mount(path):
             return
@@ -378,6 +413,15 @@ class Prefetcher:
                 heapq.heappush(self.queue, (prio, next(self.counter), job))
                 self.cv.notify()
 
+    def refresh_blocked(self) -> None:
+        """Forget mounts that now cache (e.g. after the SSHFS switch) or changed type."""
+        for mnt, old in list(self.blocked.items()):
+            _m, fstype, opts = mount_info(mnt)
+            if caches_to_disk(fstype, opts):
+                del self.blocked[mnt]
+            elif fstype != old:
+                self.blocked[mnt] = fstype
+
     def uncached_mount(self, path: str) -> str | None:
         """The mountpoint if `path` is on a filesystem that can't cache to disk.
 
@@ -386,6 +430,7 @@ class Prefetcher:
         """
         mnt, fstype, opts = mount_info(path)
         if caches_to_disk(fstype, opts):
+            self.blocked.pop(mnt, None)
             return None
         if mnt not in self.blocked:
             self.blocked[mnt] = fstype
@@ -457,7 +502,16 @@ class Prefetcher:
                         del self.active[job.path]
                     # Failed reads are retried on the next poll.
                     if ok and not self.stop.is_set():
-                        (self.heads if job.end else self.done)[job.path] = time.time()
+                        now = time.time()
+                        if job.end:
+                            self.heads[job.path] = now
+                        elif job.start > 0:
+                            # Started mid-file (the playhead): not the whole file.
+                            old = self.tails.get(job.path)
+                            self.tails[job.path] = (min(job.start, old[0]) if old else job.start,
+                                                    now)
+                        else:
+                            self.done[job.path] = now
 
     def saw_playing(self, paths: list[str]) -> None:
         now = time.time()
@@ -507,6 +561,8 @@ class Prefetcher:
             for seen in (self.done, self.heads):
                 for path in [p for p, t in seen.items() if t < cutoff]:
                     del seen[path]
+            for path in [p for p, (_o, t) in self.tails.items() if t < cutoff]:
+                del self.tails[path]
 
     def snapshot(self) -> dict:
         """State for the status page."""
@@ -534,17 +590,91 @@ class Prefetcher:
         polled, err = self.last_poll
         with self.cv:
             done = dict(self.done)
-        return {"jobs": rows, "done": done, "poll_secs": self.last_poll_secs, "warned": sorted(self.warned),
+            tails = {p: o for p, (o, _t) in self.tails.items()}
+        return {"jobs": rows, "done": done, "tails": tails, "poll_secs": self.last_poll_secs, "warned": sorted(self.warned),
                 "blocked": dict(self.blocked), "recent": list(self.recent), "sessions": self.sessions,
-                "last_poll": polled, "poll_error": err}
+                "last_poll": polled, "poll_error": err, "history": list(self.history)}
 
     def shutdown(self, *_args) -> None:
         self.stop.set()
         with self.cv:
             self.cv.notify_all()
 
+    # What was cached, recent downloads and the graphs survive restarts and updates.
+
+    def save_state(self) -> None:
+        path = self.cfg.state_file
+        if not path:
+            return
+        with self.cv:
+            state = {"version": 1, "done": dict(self.done), "heads": dict(self.heads),
+                     "tails": {p: [o, t] for p, (o, t) in self.tails.items()},
+                     "recent": list(self.recent), "history": list(self.history)}
+        tmp = path + ".tmp"
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(tmp, "w") as f:
+                json.dump(state, f)
+            os.replace(tmp, path)
+        except OSError as e:
+            log.warning("could not save state to %s: %s", path, e)
+
+    def load_state(self) -> None:
+        path = self.cfg.state_file
+        if not path:
+            return
+        try:
+            with open(path) as f:
+                state = json.load(f)
+        except FileNotFoundError:
+            return
+        except (OSError, ValueError) as e:
+            log.warning("ignoring unreadable state file %s: %s", path, e)
+            return
+        if not isinstance(state, dict):
+            return
+        with self.cv:
+            saved = state.get("tails")
+            if isinstance(saved, dict):
+                for k, v in saved.items():
+                    if (isinstance(v, list) and len(v) == 2
+                            and all(isinstance(x, (int, float)) for x in v)):
+                        self.tails[str(k)] = (int(v[0]), float(v[1]))
+            for name in ("done", "heads"):
+                saved = state.get(name)
+                if isinstance(saved, dict):
+                    getattr(self, name).update(
+                        {str(k): float(v) for k, v in saved.items()
+                         if isinstance(v, (int, float))})
+            for name in ("recent", "history"):
+                saved = state.get(name)
+                if isinstance(saved, list):
+                    getattr(self, name).extend(x for x in saved if isinstance(x, dict))
+        self.forget_expired()
+        cutoff = time.time() - HISTORY_POINTS * HISTORY_STEP
+        with self.cv:
+            while self.history and self.history[0].get("t", 0) < cutoff:
+                self.history.popleft()
+        log.info("restored state: %d cached files, %d graph points",
+                 len(self.done), len(self.history))
+
+    def record_history(self, data: dict) -> None:
+        """Add one graph point from a status_data() snapshot."""
+        streams = data.get("streams") or []
+        point = {
+            "t": round(time.time()),
+            "cache": data["cache"].get("used") if data.get("cache") else None,
+            "mbps": round(sum(j.get("rate") or 0 for j in data.get("jobs", [])
+                              if j.get("state") != "queued") * 8 / 1e6, 1),
+            "playing": len(streams),
+            "waiting": sum(1 for x in streams if x.get("level") == BAD),
+        }
+        with self.cv:
+            self.history.append(point)
+
 
 def poll_once(plex: Plex, cfg: Config, pf: Prefetcher) -> None:
+    pf.refresh_blocked()
     sessions = parse_sessions(plex.get("/status/sessions"))
     for s in sessions:
         s["path"] = cfg.local_path(s["file"])
@@ -626,11 +756,13 @@ def run_daemon(cfg: Config) -> None:
     pf = Prefetcher(cfg)
     signal.signal(signal.SIGTERM, pf.shutdown)
     signal.signal(signal.SIGINT, pf.shutdown)
+    pf.load_state()
     pf.ensure_workers()
     if cfg.status_port:
         start_status_server(cfg, pf)
     log.info("watching %s every %.0fs with %d workers",
              cfg.plex_url, cfg.poll_interval, cfg.workers)
+    last_sample = 0.0
     while not pf.stop.is_set():
         t0 = time.time()
         try:
@@ -641,11 +773,19 @@ def run_daemon(cfg: Config) -> None:
             if pf.last_poll_secs > 10:
                 log.warning("checking Plex took %.0fs; the media mount is slow to respond",
                             pf.last_poll_secs)
-        except (OSError, ET.ParseError) as e:
+        except (OSError, ET.ParseError, http.client.HTTPException) as e:
             log.warning("poll failed: %s", e)
             pf.last_poll = (time.time(), str(e))
         pf.forget_expired()
+        if time.time() - last_sample >= HISTORY_STEP:
+            last_sample = time.time()
+            try:
+                pf.record_history(status_data(cfg, pf))
+            except Exception as e:  # a graph point is never worth stopping for
+                log.warning("could not record history: %s", e)
+            pf.save_state()
         pf.stop.wait(cfg.poll_interval)
+    pf.save_state()
 
 
 # --------------------------------------------------------------------------
@@ -774,6 +914,9 @@ def stream_health(s: dict, d: dict, now: float | None = None) -> dict:
 
     if job is None and path in d.get("done", {}):
         level, msg = GOOD, "Fully cached: playing from local disk."
+        out["ahead_s"] = (size - playhead) / bitrate if bitrate else None
+    elif job is None and playhead >= d.get("tails", {}).get(path, size + 1):
+        level, msg = GOOD, "Cached from here to the end: playing from local disk."
         out["ahead_s"] = (size - playhead) / bitrate if bitrate else None
     elif job is not None and job["state"] == "queued":
         level, msg = WARN, ("Waiting for a free worker; other downloads are using them. "
@@ -922,6 +1065,61 @@ VERDICT = {
 }
 
 
+def _spark(points: list[dict], key: str, t0: float, span: float, cls: str,
+           area: bool = False) -> tuple[str, float]:
+    """An SVG path for one series, drawn 600 wide by 60 high; returns (svg, max)."""
+    vals = [(p["t"], p.get(key)) for p in points if isinstance(p.get(key), (int, float))]
+    top = max([v for _, v in vals] + [0])
+    if not vals or top <= 0:
+        return "", top
+    def xy(t, v):
+        return f"{(t - t0) / span * 600:.1f},{58 - v / top * 54:.1f}"
+    # Break the line where the service wasn't running.
+    segs, cur, prev = [], [], None
+    for t, v in vals:
+        if prev is not None and t - prev > HISTORY_STEP * 5:
+            segs.append(cur); cur = []
+        cur.append((t, v)); prev = t
+    segs.append(cur)
+    out = []
+    for seg in segs:
+        d = "M" + " L".join(xy(t, v) for t, v in seg)
+        if area:
+            out.append(f"<path class='{cls} fill' d='{d} L{xy(seg[-1][0], 0)} L{xy(seg[0][0], 0)} Z'/>")
+        out.append(f"<path class='{cls}' d='{d}'/>")
+    return "".join(out), top
+
+
+def render_history(points: list[dict], now: float | None = None) -> str:
+    """Three small graphs over the last 24 hours."""
+    e = html.escape
+    now = now or time.time()
+    span = HISTORY_POINTS * HISTORY_STEP
+    t0 = now - span
+    points = [p for p in points if isinstance(p, dict) and p.get("t", 0) >= t0]
+    if len(points) < 2:
+        return ("<p class=muted>Graphs appear here once Plex-Cache has been running for a "
+                "few minutes.</p>")
+    rows = []
+    cache, top = _spark(points, "cache", t0, span, "g-cache")
+    rows.append(("Cache size", cache, _gb(top) + " max"))
+    dl, top = _spark(points, "mbps", t0, span, "g-dl", area=True)
+    rows.append(("Pre-cache download speed", dl, f"{top:.0f} Mbps max"))
+    playing, top = _spark(points, "playing", t0, span, "g-play", area=True)
+    waits = [p for p in points if p.get("waiting")]
+    marks = "".join(
+        f"<rect class='g-wait' x='{(p['t'] - t0) / span * 600 - 1:.1f}' y='0' width='2' height='60'/>"
+        for p in waits)
+    mins = len(waits) * HISTORY_STEP // 60
+    rows.append(("Streams playing, red where one was buffering", marks + playing,
+                 f"buffering about {mins} min" if mins else "no buffering"))
+    body = "".join(
+        f"<div class=graph><div class=row><span>{e(label)}</span><span class=muted>{e(note)}</span></div>"
+        f"<svg viewBox='0 0 600 60' preserveAspectRatio=none role=img aria-label='{e(label)}'>{svg}</svg></div>"
+        for label, svg, note in rows)
+    return body + "<div class='row muted'><span>24 hours ago</span><span>now</span></div>"
+
+
 def render_status(d: dict, settings: str = "") -> str:
     e = html.escape
     c = d["cache"]
@@ -991,6 +1189,11 @@ var(--info);border-radius:6px;padding:10px 12px;margin:8px 0}}.card p{{margin:6p
 .bar i{{display:block;height:100%;background:var(--good)}}.card.warn .bar i{{background:var(--warn)}}
 .card.bad .bar i{{background:var(--bad)}}button{{font:inherit;font-size:13px;font-weight:600;padding:7px 14px;border-radius:8px;border:1px solid var(--line);background:var(--btn);color:var(--fg);cursor:pointer;transition:filter .15s,border-color .15s}}button:hover{{filter:brightness(1.08);border-color:var(--muted)}}button:active{{transform:translateY(1px)}}button:disabled{{opacity:.55;cursor:default}}button:focus-visible{{outline:2px solid var(--accent);outline-offset:2px}}button.pri{{background:var(--accent);color:var(--accent-fg);border-color:var(--accent)}}#theme{{margin-left:auto;margin-right:8px;border-radius:999px;padding:5px 12px}}
 details{{margin-top:24px}}
+.graph{{margin:10px 0}}.graph svg{{display:block;width:100%;height:60px;background:var(--card);
+border-radius:6px;margin-top:4px}}.graph path{{fill:none;stroke-width:1.5;vector-effect:non-scaling-stroke}}
+.graph path.fill{{stroke:none;opacity:.18}}.g-cache{{stroke:var(--info)}}.g-dl{{stroke:var(--good)}}
+.g-dl.fill{{fill:var(--good)}}.g-play{{stroke:var(--accent)}}.g-play.fill{{fill:var(--accent)}}
+.g-wait{{fill:var(--bad);opacity:.5}}
 .live{{display:inline-flex;align-items:center;gap:8px;border:1px solid var(--line);
 background:var(--card);color:var(--fg);border-radius:999px;padding:5px 12px 5px 10px;
 cursor:pointer;font-size:13px;line-height:1.2}}.live:hover{{border-color:var(--muted)}}
@@ -1019,6 +1222,7 @@ title="Pause or resume live updates"><span class=dot></span><b id=livetext>Live<
 <div><b>{_gb(d.get('mem_available'))}</b><span class=muted>RAM available</span></div>
 <div><b>{len(d['sessions'])}</b><span class=muted>playing in Plex</span></div></div>
 <h2>Streams</h2>{streams}
+<h2>Last 24 hours</h2>{render_history(d.get("history") or [])}
 <h2>Health</h2><div class=scroll><table>{checks}</table></div>
 <h2>Caching now</h2><div class=scroll><table><tr><th>File</th><th>Why</th><th>State</th><th>Progress</th>
 <th>Speed</th></tr>{rows}</table></div>
@@ -1155,7 +1359,7 @@ with --warm before watching, lower the quality in Plex, or give the cache more d
       try {{ sessionStorage.setItem("plexcache-scroll", String(window.scrollY)); }} catch (e) {{}}
     }});
   }});
-  if (/[?&]saved=1/.test(location.search)) {{
+  if (/[?&]saved=/.test(location.search)) {{
     var y = null;
     try {{ y = sessionStorage.getItem("plexcache-scroll");
            sessionStorage.removeItem("plexcache-scroll"); }} catch (e) {{}}
@@ -1229,6 +1433,17 @@ RCLONE_DEFAULTS = {"VFS_CHUNK_SIZE": "64M", "DIR_CACHE_TIME": "1h"}
 # Flags that would point rclone somewhere else or expose it; set elsewhere or not at all.
 BLOCKED_FLAGS = ("--config", "--cache-dir", "--rc", "--daemon", "--allow-root",
                  "--log-file", "--password-command", "--user-agent", "--ask-password")
+# Only mount-tuning flags are accepted. rclone has flags that run programs
+# (--sftp-ssh), open listeners (--metrics-addr) or redirect the remote
+# (--sftp-host), and the service user can write this setting.
+ALLOWED_FLAGS = ("--bwlimit", "--bwlimit-file", "--transfers", "--checkers", "--tpslimit",
+                 "--tpslimit-burst", "--timeout", "--contimeout", "--retries",
+                 "--low-level-retries", "--attr-timeout", "--poll-interval", "--no-modtime",
+                 "--no-checksum", "--no-seek", "--read-only", "--async-read", "--use-mmap",
+                 "--max-read-ahead", "--multi-thread-streams", "--multi-thread-cutoff",
+                 "--sftp-concurrency", "--sftp-chunk-size", "--sftp-idle-timeout",
+                 "--sftp-set-modtime", "--sftp-disable-concurrent-reads",
+                 "--sftp-disable-concurrent-writes", "--sftp-use-fstat")
 FLAG_TOKEN_RE = re.compile(r"^(--?[A-Za-z0-9][A-Za-z0-9-]*(=[A-Za-z0-9._:/,+@%-]*)?"
                            r"|[A-Za-z0-9._:/,+@%-]+)$")
 SIZE_RE = re.compile(r"^\d+(\.\d+)?[KMGT]$")
@@ -1327,8 +1542,10 @@ def validate_flags(raw: str) -> str:
         if not FLAG_TOKEN_RE.match(t):
             raise SettingsError(f"Extra rclone flags: can't use {t!r}. Use plain flags "
                                 "like --bwlimit 80M.")
-        if t.startswith("-") and t.split("=", 1)[0].startswith(BLOCKED_FLAGS):
-            raise SettingsError(f"Extra rclone flags: {t.split('=', 1)[0]} can't be set here.")
+        name = t.split("=", 1)[0]
+        if t.startswith("-") and (name.startswith(BLOCKED_FLAGS)
+                                  or not (name.startswith("--vfs-") or name in ALLOWED_FLAGS)):
+            raise SettingsError(f"Extra rclone flags: {name} can't be set here.")
     if tokens and not tokens[0].startswith("-"):
         raise SettingsError("Extra rclone flags must start with a flag such as --bwlimit.")
     return " ".join(tokens)
@@ -2046,39 +2263,73 @@ PANEL_FOR_ACTION = {
 }
 
 
-def start_status_server(cfg: Config, pf: Prefetcher) -> None:
+def start_status_server(cfg: Config, pf: Prefetcher) -> http.server.ThreadingHTTPServer | None:
     token = secrets.token_urlsafe(24)  # CSRF token for the settings forms
-    last_msg: dict = {}
+    # What each save said, by id, so the page that asked gets its own answer.
+    messages: dict = {}
+    msg_lock = threading.Lock()
 
     class Handler(http.server.BaseHTTPRequestHandler):
+        timeout = 30  # a stalled client can't hold a thread forever
+
         def _send(self, body: bytes, ctype: str, status: int = 200) -> None:
             self.send_response(status)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
+            # Not to be framed by another site (clickjacking on the Update/Switch buttons).
+            self.send_header("X-Frame-Options", "DENY")
+            self.send_header("Content-Security-Policy", "frame-ancestors 'none'")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Referrer-Policy", "no-referrer")
             self.end_headers()
             self.wfile.write(body)
 
+        def _authorized(self) -> bool:
+            """nginx adds the key after its own login; other local users don't have it."""
+            key = cfg.status_key
+            if not key:
+                return True
+            got = self.headers.get("X-Plexcache-Key", "")
+            if secrets.compare_digest(got.encode(), key.encode()):
+                return True
+            self._send(b"Forbidden", "text/plain", 403)
+            return False
+
         def do_GET(self):
+            if not self._authorized():
+                return
             data = status_data(cfg, pf)
             if self.path.rstrip("/").endswith("/api/status"):
                 data = dict(data, build=installed_version())
                 self._send(json.dumps(data).encode(), "application/json")
                 return
-            msg = last_msg.pop("text", None) if "saved=1" in self.path else None
-            ok = last_msg.pop("ok", True)
-            prefill = last_msg.pop("conn", None) if msg else None
+            note = {}
+            m = re.search(r"[?&]saved=([A-Za-z0-9_-]+)", self.path)
+            if m:
+                with msg_lock:
+                    note = messages.pop(m.group(1), {})
+            msg, ok, prefill = note.get("text"), note.get("ok", True), note.get("conn")
             settings = render_settings(cfg, token, msg, ok, prefill) if cfg.path else ""
             self._send(render_status(data, settings).encode(), "text/html; charset=utf-8")
 
         def do_POST(self):
-            length = min(int(self.headers.get("Content-Length") or 0), 64 * 1024)
+            if not self._authorized():
+                return
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                length = -1
+            if length < 0 or length > 64 * 1024:
+                self._send(b"Bad request", "text/plain", 400 if length < 0 else 413)
+                return
             form = {k: v[-1] for k, v in urllib.parse.parse_qs(
                 self.rfile.read(length).decode("utf-8", "replace")).items()}
             if not secrets.compare_digest(form.get("token", ""), token):
                 self._send(b"Stale or missing form token; reload the page.", "text/plain", 403)
                 return
             action = self.path.split("?")[0].rstrip("/").rsplit("/", 2)[-2:]
+            note: dict = {}
             try:
                 if action == ["settings", "prefetch"]:
                     text = apply_prefetch_settings(cfg, pf, form)
@@ -2086,11 +2337,11 @@ def start_status_server(cfg: Config, pf: Prefetcher) -> None:
                     text = apply_mount_settings(cfg, form)
                 elif action == ["settings", "connection"]:
                     # Keep what was typed (not the key) so a test can be followed by a save.
-                    last_msg["conn"] = {k: form.get(k, "") for k in
-                                        ("host", "user", "port", "path", "mountpoint")}
+                    note["conn"] = {k: form.get(k, "") for k in
+                                    ("host", "user", "port", "path", "mountpoint")}
                     text = apply_connection(cfg, form)
                     if form.get("do") != "test":
-                        last_msg.pop("conn", None)
+                        note.pop("conn", None)
                 elif action == ["settings", "recommended"]:
                     text = apply_recommended(cfg, pf, form)
                 elif action == ["switch", "check"]:
@@ -2112,17 +2363,22 @@ def start_status_server(cfg: Config, pf: Prefetcher) -> None:
                 else:
                     self._send(b"Not found", "text/plain", 404)
                     return
-                last_msg.update(text=text, ok=not text.startswith("Couldn't")
-                                and "couldn't" not in text)
+                note.update(text=text, ok=not text.startswith("Couldn't")
+                            and "couldn't" not in text)
                 log.info("web: %s", text)
             except (SettingsError, OSError) as err:
-                last_msg.update(text=str(err), ok=False)
+                note.update(text=str(err), ok=False)
+            msg_id = secrets.token_urlsafe(8)
+            with msg_lock:
+                messages[msg_id] = note
+                while len(messages) > 20:
+                    del messages[next(iter(messages))]
             # Back to the page; relative so it works behind nginx's /plexcache/ prefix.
             depth = self.path.split("?")[0].strip("/").count("/")
             anchor = PANEL_FOR_ACTION.get("/".join(action), PANEL_FOR_ACTION.get(action[-1],
                                                                                   "settings"))
             self.send_response(303)
-            self.send_header("Location", "../" * depth + "./?saved=1#" + anchor)
+            self.send_header("Location", "../" * depth + "./?saved=" + msg_id + "#" + anchor)
             self.end_headers()
 
         def log_message(self, *_args):
@@ -2132,9 +2388,10 @@ def start_status_server(cfg: Config, pf: Prefetcher) -> None:
         srv = http.server.ThreadingHTTPServer((cfg.status_bind, cfg.status_port), Handler)
     except OSError as e:
         log.warning("status page disabled: %s", e)
-        return
+        return None
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     log.info("status page on http://%s:%d/", cfg.status_bind, cfg.status_port)
+    return srv
 
 
 def warm(cfg: Config, paths: list[str]) -> None:

@@ -9,6 +9,7 @@ ExecStart=/usr/bin/python3 /opt/plex-precache/plex_precache.py -c /etc/plex-prec
 Restart=on-failure
 RestartSec=15
 Nice=10
+StateDirectory=plex-precache
 
 [Install]
 WantedBy=multi-user.target

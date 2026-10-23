@@ -76,6 +76,12 @@ if [ -z "$MOUNT_AT" ] && [ "$MODE" != back ] && [ -z "$SFTP" ] \
   [ "$(grep -c . <<<"$only" || true)" -eq 1 ] && MOUNTPOINT="$only"
 fi
 [ -n "$MOUNTPOINT" ] || fail "No mount location; pass --mountpoint /data."
+# The env file is writable by the service user, and this script chowns the mountpoint.
+case "${MOUNTPOINT%/}" in
+  ""|/|/bin|/boot|/dev|/etc|/home|/lib|/lib64|/media|/mnt|/opt|/proc|/root|/run|/sbin|/srv|/sys|/tmp|/usr|/var|/var/lib|/var/cache|\
+  /bin/*|/boot/*|/dev/*|/etc/*|/lib/*|/lib64/*|/proc/*|/root/*|/run/*|/sbin/*|/sys/*|/usr/*|*..*|*[!A-Za-z0-9._/\ -]*)
+    fail "'$MOUNTPOINT' isn't a usable mount location; pass --mountpoint /data." ;;
+esac
 
 fstype() { findmnt -n -o FSTYPE --mountpoint "$MOUNTPOINT" 2>/dev/null | tail -1; }
 # Active fstab lines that mount SSHFS at $MOUNTPOINT.

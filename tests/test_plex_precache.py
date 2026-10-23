@@ -1,5 +1,7 @@
+import http.client
 import os
 import re
+import socket
 import subprocess
 import sys
 import tempfile
@@ -578,8 +580,11 @@ class RcloneSettingsTests(unittest.TestCase):
         self.assertEqual(pp.validate_flags("  --bwlimit 80M   --vfs-read-chunk-streams=4 "),
                          "--bwlimit 80M --vfs-read-chunk-streams=4")
         self.assertEqual(pp.validate_flags(""), "")
+        # Flags that run programs, open ports or redirect the remote.
         for bad in ("--rc", "--rc-addr :5572", "--config /tmp/x", "--bwlimit $(id)",
-                    "80M --bwlimit", "--x;reboot", "--x\nEVIL=1"):
+                    "80M --bwlimit", "--x;reboot", "--x\nEVIL=1", "--sftp-ssh /tmp/evil",
+                    "--sftp-server-command=/bin/sh", "--metrics-addr 0.0.0.0:9000",
+                    "--sftp-host evil.example", "--bwlimit 1M --sftp-ssh x"):
             with self.assertRaises(pp.SettingsError, msg=bad):
                 pp.validate_flags(bad)
 
@@ -647,6 +652,267 @@ class RcloneSettingsTests(unittest.TestCase):
         with mock.patch.object(pp.subprocess, "run", no_sudo):
             self.assertEqual(self.real_restart({self.env: old}), "no-restart")
         self.assertIn("--nonsense", open(self.env).read())
+
+
+class StateTests(unittest.TestCase):
+    def test_state_survives_restart(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = pp.Config(None)
+            cfg.state_file = os.path.join(d, "sub", "state.json")
+            pf = pp.Prefetcher(cfg)
+            now = pp.time.time()
+            pf.done["/m/a.mkv"] = now
+            pf.done["/m/old.mkv"] = now - cfg.remember - 10
+            pf.heads["/m/b.mkv"] = now
+            pf.recent.append({"path": "/m/a.mkv", "mb": 5, "secs": 1, "at": now})
+            pf.history.append({"t": now - 90000, "cache": 1})  # older than a day
+            pf.record_history({"cache": {"used": 2 * pp.MB}, "streams": [{"level": pp.BAD}],
+                               "jobs": [{"rate": pp.MB, "state": "reading"}]})
+            pf.save_state()
+            pf2 = pp.Prefetcher(cfg)
+            pf2.load_state()
+            self.assertEqual(set(pf2.done), {"/m/a.mkv"})
+            self.assertIn("/m/b.mkv", pf2.heads)
+            self.assertEqual(len(pf2.recent), 1)
+            self.assertEqual([(p["playing"], p["waiting"]) for p in pf2.history], [(1, 1)])
+            # A broken file is ignored rather than stopping the service.
+            with open(cfg.state_file, "w") as f:
+                f.write("{not json")
+            pp.Prefetcher(cfg).load_state()
+
+    def test_history_graphs(self):
+        now = 1_000_000.0
+        self.assertIn("once Plex-Cache has been running", pp.render_history([], now))
+        pts = [{"t": now - 600 + i * 60, "cache": i * pp.MB, "mbps": i, "playing": 1,
+                "waiting": 1 if i == 3 else 0} for i in range(10)]
+        html_ = pp.render_history(pts, now)
+        self.assertEqual(html_.count("<svg"), 3)
+        self.assertIn("class='g-wait'", html_)
+        self.assertIn("buffering about 1 min", html_)
+
+
+class PartialReadTests(unittest.TestCase):
+    def test_reading_from_mid_file_is_not_fully_cached(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "film.mkv")
+            with open(path, "wb") as f:
+                f.write(b"\0" * 4000)
+            cfg = pp.Config(None)
+            cfg.read_block = 1000
+            pf = pp.Prefetcher(cfg)
+            pf.submit(path, start=3000)
+            pf.stop.clear()
+            job = pf.queue[0][2]
+            pf.queue.clear()
+            pp.read_through(job, 1000, pf.stop)
+            with pf.cv:
+                pf.tails[path] = (job.start, pp.time.time())
+                del pf.active[path]
+            self.assertNotIn(path, pf.done)
+            pf.submit(path, start=3000)  # same spot again: nothing to do
+            self.assertEqual(len(pf.queue), 0)
+            pf.submit(path, start=0)  # watched again from the start: read it
+            self.assertEqual(len(pf.queue), 1)
+
+    def test_worker_records_tail_then_done(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "film.mkv")
+            with open(path, "wb") as f:
+                f.write(b"\0" * 4000)
+            cfg = pp.Config(None)
+            cfg.read_block = 1000
+            pf = pp.Prefetcher(cfg)
+            for start in (3000, 0):
+                pf.submit(path, start=start)
+                pf.ensure_workers()
+                for _ in range(100):
+                    with pf.cv:
+                        if path not in pf.active:
+                            break
+                    pp.time.sleep(0.05)
+                pf.n_workers = 0
+                if start:
+                    self.assertEqual(pf.tails[path][0], 3000)
+                    self.assertNotIn(path, pf.done)
+            self.assertIn(path, pf.done)
+            pf.shutdown()
+
+    def test_tail_card_only_when_playhead_is_inside_it(self):
+        s = {"file": "/m/a.mkv", "path": "/m/a.mkv", "size": 1000, "duration": 1000,
+             "view_offset": 800, "state": "paused"}
+        d = {"jobs": [], "done": {}, "warned": [], "tails": {"/m/a.mkv": 700}}
+        self.assertIn("Cached from here", pp.stream_health(s, d)["detail"])
+        d["tails"]["/m/a.mkv"] = 900
+        self.assertNotIn("Cached", pp.stream_health(s, d)["detail"])
+
+    def test_tails_survive_restart(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = pp.Config(None)
+            cfg.state_file = os.path.join(d, "state.json")
+            pf = pp.Prefetcher(cfg)
+            pf.tails["/m/a.mkv"] = (5, pp.time.time())
+            pf.save_state()
+            pf2 = pp.Prefetcher(cfg)
+            pf2.load_state()
+            self.assertEqual(pf2.tails["/m/a.mkv"][0], 5)
+
+
+class BlockedMountTests(unittest.TestCase):
+    def test_blocked_flag_clears_when_mount_starts_caching(self):
+        pf = pp.Prefetcher(pp.Config(None))
+        pf.blocked["/data"] = "fuse.sshfs"
+        with mock.patch.object(pp, "mount_info", return_value=("/data", "fuse.rclone", "rw")):
+            pf.refresh_blocked()
+        self.assertEqual(pf.blocked, {})
+        pf.blocked["/data"] = "fuse.sshfs"
+        with mock.patch.object(pp, "mount_info", return_value=("/data", "nfs4", "rw")):
+            pf.refresh_blocked()
+        self.assertEqual(pf.blocked, {"/data": "nfs4"})
+
+    def test_poll_survives_a_cut_off_reply(self):
+        class Boom:
+            def get(self, _path):
+                raise http.client.IncompleteRead(b"")
+        cfg = pp.Config(None)
+        cfg.poll_interval = 0.01
+        pf = pp.Prefetcher(cfg)
+        threading.Timer(0.3, pf.shutdown).start()
+        with mock.patch.object(pp, "Plex", return_value=Boom()), \
+                mock.patch.object(pp.Prefetcher, "load_state"), \
+                mock.patch.object(pp, "Prefetcher", return_value=pf):
+            cfg.status_port = 0
+            cfg.state_file = ""
+            pp.run_daemon(cfg)  # returns instead of raising
+        self.assertIn("IncompleteRead", pf.last_poll[1] or "")
+
+
+class WebServerTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        ini = os.path.join(self.tmp.name, "config.ini")
+        with open(ini, "w") as f:
+            f.write("[plex]\nworkers = 2\n")
+        self.cfg = pp.Config(ini)
+        self.cfg.status_bind, self.cfg.status_port = "127.0.0.1", 0
+        self.cfg.mount_env = ""
+        self.cfg.state_file = ""
+        self.cfg.cache_dir = self.tmp.name
+        self.cfg.status_key = "s3cret"
+        self.srv = pp.start_status_server(self.cfg, pp.Prefetcher(self.cfg))
+        self.port = self.srv.server_address[1]
+
+    def tearDown(self):
+        self.srv.shutdown()
+        self.srv.server_close()
+        self.tmp.cleanup()
+
+    def request(self, method="GET", path="/", headers=None, body=None):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        conn.request(method, path, body=body, headers=headers or {})
+        resp = conn.getresponse()
+        data = resp.read()
+        conn.close()
+        return resp, data
+
+    def test_key_required_when_configured(self):
+        self.assertEqual(self.request()[0].status, 403)
+        self.assertEqual(self.request(method="POST", path="/warm", body="token=x")[0].status, 403)
+        self.assertEqual(self.request(headers={"X-Plexcache-Key": "wrong"})[0].status, 403)
+        resp, _ = self.request(headers={"X-Plexcache-Key": "s3cret"})
+        self.assertEqual(resp.status, 200)
+        self.cfg.status_key = ""  # no key file: open, as before
+        self.assertEqual(self.request()[0].status, 200)
+
+    def test_missing_key_file_is_open_and_unreadable_one_stops_the_service(self):
+        self.assertEqual(pp.read_status_key(os.path.join(self.tmp.name, "none")), "")
+        self.assertEqual(pp.read_status_key(""), "")
+        with mock.patch("builtins.open", side_effect=PermissionError("denied")):
+            with self.assertRaises(SystemExit):
+                pp.read_status_key("/etc/plex-precache/status.key")
+
+    def test_cannot_be_framed(self):
+        resp, _ = self.request(headers={"X-Plexcache-Key": "s3cret"})
+        self.assertEqual(resp.getheader("X-Frame-Options"), "DENY")
+        self.assertIn("frame-ancestors 'none'", resp.getheader("Content-Security-Policy"))
+        self.assertEqual(resp.getheader("X-Content-Type-Options"), "nosniff")
+
+    def test_bad_content_length(self):
+        for bad, status in (("-1", 400), ("abc", 400), ("999999", 413)):
+            s = socket.create_connection(("127.0.0.1", self.port), timeout=5)
+            s.sendall((f"POST /warm HTTP/1.1\r\nHost: x\r\nX-Plexcache-Key: s3cret\r\n"
+                       f"Content-Length: {bad}\r\n\r\n").encode())
+            self.assertIn(f" {status} ".encode(), s.recv(200).split(b"\r\n")[0] + b" ", bad)
+            s.close()
+
+    def test_each_save_message_goes_to_its_own_page(self):
+        hdr = {"X-Plexcache-Key": "s3cret"}
+        page = self.request(headers=hdr)[1].decode()
+        token = re.search(r"name=token value='([^']+)'", page).group(1)
+        resp, _ = self.request("POST", "/settings/prefetch", hdr,
+                               f"token={token}&workers=99")
+        self.assertEqual(resp.status, 303)
+        first = resp.getheader("Location")
+        resp, _ = self.request("POST", "/settings/prefetch", hdr, f"token={token}&workers=99")
+        second = resp.getheader("Location")
+        self.assertNotEqual(first, second)
+        # A refresh from another tab (no id) doesn't take the message away.
+        self.assertNotIn("id=toast", self.request(headers=hdr)[1].decode())
+        shown = self.request(path="/" + second.lstrip("./"), headers=hdr)[1].decode()
+        self.assertIn("id=toast", shown)
+        self.assertIn("class='notice toast bad'", shown)
+        again = self.request(path="/" + second.lstrip("./"), headers=hdr)[1].decode()
+        self.assertNotIn("id=toast", again)
+
+
+class ShellScriptTests(unittest.TestCase):
+    """The root scripts must treat the service user's env file as text, not code."""
+    ROOT = os.path.join(os.path.dirname(__file__), "..")
+
+    def run_resize(self, env_text, *args):
+        with tempfile.TemporaryDirectory() as d:
+            env = os.path.join(d, "env")
+            cache = os.path.join(d, "cache")
+            os.mkdir(cache)
+            with open(env, "w") as f:
+                f.write(env_text.replace("@CACHE@", cache))
+            out = subprocess.run(["bash", os.path.join(self.ROOT, "plex-cache-resize"), *args],
+                                 env=dict(os.environ, PLEX_CACHE_ENV=env),
+                                 capture_output=True, text=True)
+            return out, d
+
+    def test_resize_does_not_run_env_values(self):
+        marker = tempfile.mktemp()
+        out, _ = self.run_resize(
+            f"CACHE_DIR=@CACHE@\nCACHE_MAX_SIZE=20G\nCACHE_MIN_FREE=10G\n"
+            f"CACHE_MAX_AGE=$(touch {marker})\n", "--show")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertFalse(os.path.exists(marker))
+        self.assertIn("Cache max size: 20G", out.stdout)
+
+    def test_resize_refuses_system_folders_and_non_sizes(self):
+        out, _ = self.run_resize("CACHE_DIR=/etc\nCACHE_MAX_SIZE=20G\n", "--show")
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn("isn't a usable folder", out.stderr)
+        marker = tempfile.mktemp()
+        out, _ = self.run_resize(
+            f"CACHE_DIR=@CACHE@\nCACHE_MIN_FREE=a[$(touch {marker})]\n", "--show")
+        self.assertNotEqual(out.returncode, 0)
+        self.assertFalse(os.path.exists(marker))
+
+    def test_scripts_never_source_the_env_file(self):
+        for name in ("install.sh", "plex-cache-resize", "plex-cache-switch"):
+            with open(os.path.join(self.ROOT, name)) as f:
+                text = f.read()
+            self.assertIsNone(re.search(r'^\s*(\.|source)\s+\S*(rclone-mount\.env|ENV_FILE)',
+                                        text, re.M), name)
+
+    def test_to_gb_handles_decimals(self):
+        with open(os.path.join(self.ROOT, "plex-cache-resize")) as f:
+            text = f.read()
+        fn = re.search(r"^to_gb\(\) \{.*?^\}", text, re.M | re.S).group(0)
+        out = subprocess.run(["bash", "-c", fn + '\nfor v in 25G 512M 1T 10.5G; do to_gb $v; done'],
+                             capture_output=True, text=True)
+        self.assertEqual(out.stdout.split(), ["25", "0", "1024", "10"])
 
 
 class VersionTests(unittest.TestCase):

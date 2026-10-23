@@ -32,17 +32,37 @@ while [ $# -gt 0 ]; do
 done
 
 [ -f "$ENV_FILE" ] || { echo "$ENV_FILE not found; was install.sh run with --with-mount?" >&2; exit 1; }
-# shellcheck disable=SC1090
-. "$ENV_FILE"
-
-to_gb() {  # 25G -> 25, 512M -> 0, 1T -> 1024
-  local v=${1%[Bb]}
-  case "$v" in
-    *[Tt]) echo $(( ${v%[Tt]} * 1024 )) ;;
-    *[Gg]) echo "${v%[Gg]}" ;;
-    *[Mm]) echo $(( ${v%[Mm]} / 1024 )) ;;
-    *) echo "$v" ;;
+# The env file is writable by the service user, so root never sources it: values
+# are read as text, and folders root creates or re-owns must be ordinary ones.
+safe_dir() {  # path -> ok when it isn't a system folder
+  local d="${1%/}"
+  case "$d" in
+    ""|/|/bin|/boot|/dev|/etc|/home|/lib|/lib64|/media|/mnt|/opt|/proc|/root|/run|/sbin|/srv|/sys|/tmp|/usr|/var|/var/lib|/var/cache) return 1 ;;
+    /bin/*|/boot/*|/dev/*|/etc/*|/lib/*|/lib64/*|/proc/*|/root/*|/run/*|/sbin/*|/sys/*|/usr/*) return 1 ;;
   esac
+  case "$d" in /*) ;; *) return 1 ;; esac
+  case "$d" in *..*|*[!A-Za-z0-9._/\ -]*) return 1 ;; esac
+  return 0
+}
+env_get() { sed -n "s/^$1=//p" "$ENV_FILE" | tail -1 | sed 's/^"\(.*\)"$/\1/'; }
+CACHE_DIR="$(env_get CACHE_DIR)"
+CACHE_MAX_SIZE="$(env_get CACHE_MAX_SIZE)"
+CACHE_MIN_FREE="$(env_get CACHE_MIN_FREE)"
+CACHE_MAX_AGE="$(env_get CACHE_MAX_AGE)"
+CACHE_PERCENT="$(env_get CACHE_PERCENT)"
+safe_dir "$CACHE_DIR" || { echo "CACHE_DIR '$CACHE_DIR' in $ENV_FILE isn't a usable folder" >&2; exit 1; }
+SIZE_RE='^[0-9]+(\.[0-9]+)?[KkMmGgTt]?[Bb]?$'
+for v in "$CACHE_MAX_SIZE" "$CACHE_MIN_FREE" "$MIN_FREE" "$SIZE"; do
+  [[ -z "$v" || "$v" =~ $SIZE_RE ]] || { echo "not a size: $v" >&2; exit 1; }
+done
+for v in "$CACHE_PERCENT" "$PERCENT"; do
+  [[ -z "$v" || "$v" =~ ^[0-9]+$ ]] || { echo "not a percentage: $v" >&2; exit 1; }
+done
+
+to_gb() {  # 25G -> 25, 512M -> 0, 1T -> 1024, 10.5G -> 10 (values were checked above)
+  awk -v v="${1%[Bb]}" 'BEGIN { u = toupper(substr(v, length(v), 1)); n = v + 0
+    if (u == "T") n *= 1024; else if (u == "M") n /= 1024; else if (u == "K") n /= 1048576
+    printf "%d\n", n }'
 }
 
 set_env() {  # key value

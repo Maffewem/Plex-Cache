@@ -140,9 +140,25 @@ if [ "$WITH_MOUNT" -eq 1 ]; then
       echo "rclone ${RCLONE_VER/ /.}: downloading each file over 4 parallel streams."
     fi
   fi
-  # shellcheck disable=SC1091
-  . /etc/plex-precache/rclone-mount.env
-  install -d -o "$RUN_USER" -g "$RUN_USER" "$CACHE_DIR"
+# The env file is writable by the service user, so root never sources it: values
+# are read as text, and folders root creates or re-owns must be ordinary ones.
+safe_dir() {  # path -> ok when it isn't a system folder
+  local d="${1%/}"
+  case "$d" in
+    ""|/|/bin|/boot|/dev|/etc|/home|/lib|/lib64|/media|/mnt|/opt|/proc|/root|/run|/sbin|/srv|/sys|/tmp|/usr|/var|/var/lib|/var/cache) return 1 ;;
+    /bin/*|/boot/*|/dev/*|/etc/*|/lib/*|/lib64/*|/proc/*|/root/*|/run/*|/sbin/*|/sys/*|/usr/*) return 1 ;;
+  esac
+  case "$d" in /*) ;; *) return 1 ;; esac
+  case "$d" in *..*|*[!A-Za-z0-9._/\ -]*) return 1 ;; esac
+  return 0
+}
+  env_get() { sed -n "s/^$1=//p" /etc/plex-precache/rclone-mount.env | tail -1 | sed 's/^"\(.*\)"$/\1/'; }
+  CACHE_DIR="$(env_get CACHE_DIR)"
+  MOUNTPOINT="$(env_get MOUNTPOINT)"
+  safe_dir "$CACHE_DIR" || { echo "CACHE_DIR '$CACHE_DIR' in rclone-mount.env isn't a usable folder" >&2; exit 1; }
+  safe_dir "$MOUNTPOINT" || { echo "MOUNTPOINT '$MOUNTPOINT' in rclone-mount.env isn't a usable folder" >&2; exit 1; }
+  # Only create it; never take over a folder that already exists.
+  [ -d "$CACHE_DIR" ] || install -d -o "$RUN_USER" -g "$RUN_USER" "$CACHE_DIR"
   # Never chown an existing mountpoint: it may be the live SSHFS mount.
   [ -d "$MOUNTPOINT" ] || install -d -o "$RUN_USER" -g "$RUN_USER" "$MOUNTPOINT"
   grep -q '^user_allow_other' /etc/fuse.conf 2>/dev/null || echo user_allow_other >> /etc/fuse.conf
@@ -202,13 +218,22 @@ if [ -f /install/.nginx.lock ] && [ -d /etc/nginx/apps ]; then
   PORT="${PORT:-8789}"
   HTPASSWD="/etc/htpasswd.d/htpasswd.$MASTER"
   [ -f "$HTPASSWD" ] || HTPASSWD=/etc/htpasswd
-  sed -e "s/@PORT@/$PORT/" -e "s|/etc/htpasswd.d/htpasswd.@USER@|$HTPASSWD|" \
-    swizzin/plexcache.nginx.conf > /etc/nginx/apps/plexcache.conf
+  # Shared secret: nginx sends it after the login, and the status page refuses
+  # requests without it, so other users on this box can't use port $PORT directly.
+  KEYFILE=/etc/plex-precache/status.key
+  if [ ! -s "$KEYFILE" ]; then
+    head -c 60 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' > "$KEYFILE"
+  fi
+  chown "$RUN_USER": "$KEYFILE"
+  chmod 640 "$KEYFILE"
+  (umask 077; sed -e "s/@PORT@/$PORT/" -e "s|/etc/htpasswd.d/htpasswd.@USER@|$HTPASSWD|" \
+    -e "s/@KEY@/$(cat "$KEYFILE")/" \
+    swizzin/plexcache.nginx.conf > /etc/nginx/apps/plexcache.conf)
   if nginx -t >/dev/null 2>&1; then
     systemctl reload nginx
     echo "Status page: https://<your server>/plexcache/"
   else
-    rm -f /etc/nginx/apps/plexcache.conf
+    rm -f /etc/nginx/apps/plexcache.conf "$KEYFILE"
     echo "Warning: nginx rejected the plexcache config; status page not published." >&2
   fi
 fi
